@@ -1,0 +1,71 @@
+#!/bin/bash
+
+# CDDL HEADER START
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# http://www.illumos.org/license/CDDL.
+#
+# CDDL HEADER END
+
+# Copyright 2022 Justin Snapp. All rights reserved.
+
+# Invoke this script to build Shared Flight plugin for both Windows and Linux,
+# 32- & 64-bit flavors. Install the necessary mingw cross-compile utilities
+# first.
+# On Linux also do "apt install libopenal-dev:x86_64 libopenal-dev:i386".
+
+# Locate libacfutils and build it if necessary
+LIBACFUTILS="$(qmake -query LIBACFUTILS)"
+TESTINSTALLPATH="$(qmake -query TESTINSTALLPATH)"
+HOST_OS="$(uname)"
+STRIP="strip"
+
+release_dir="debug"
+output_dir="output"
+
+rm -rf "$release_dir" "$output_dir"/lin_x64 "$output_dir"/win_x64
+mkdir -p "$release_dir" "$output_dir"/lin_x64 "$output_dir"/win_x64
+
+	
+make distclean > /dev/null
+
+qmake -set CROSS_COMPILE x86_64-w64-mingw32- && \
+    
+if [ ! -z $1 ] 
+then
+	qmake -spec win32-g++ CS_URL=$1   
+else 
+    qmake -spec win32-g++
+fi
+
+make -j 2 && \
+mv "$release_dir/win.xpl1.dll" "$output_dir/win_x64/SamIAm.xpl" \
+&& "../tools/mksymscpp" "$output_dir/win_x64/SamIAm.xpl" > "$output_dir/win_x64/syms.txt"
+
+if [ $? != 0 ] ; then
+	exit 1
+fi
+
+make distclean > /dev/null
+if [ ! -z $1 ] 
+then
+	qmake -spec linux-g++-64 CS_URL=$1
+else 
+	qmake -spec linux-g++-64
+fi
+
+make -j 2 && \
+mv liblin.xpl.so "$output_dir/lin_x64/SamIAm.xpl"
+
+if [ $? != 0 ] ; then
+	exit 1
+fi
+
+
+make distclean > /dev/null

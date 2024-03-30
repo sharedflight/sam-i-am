@@ -1,0 +1,6 @@
+[submodule "mathc"]
+	path = mathc
+	url = https://github.com/skiselkov/mathc.git
+[submodule "libquat"]
+	path = libquat
+	url = https://github.com/skiselkov/libquat.git
