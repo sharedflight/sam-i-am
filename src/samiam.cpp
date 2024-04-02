@@ -16,6 +16,7 @@ extern "C" {
 	#include "XPLMNavigation.h"
 	#include "XPWidgets.h"
 	#include "XPStandardWidgets.h"
+	#include "XPLMInstance.h"
 	#include <string.h>
 	#include <math.h>
 
@@ -25,6 +26,7 @@ extern "C" {
 	#include <acfutils/dr.h>
 	#include <acfutils/geom.h>
 	#include <acfutils/log.h>
+	#include <acfutils/acf_file.h>
 
     #include <libquat.h>
 }
@@ -62,72 +64,31 @@ namespace fs = std::filesystem;
 
 #include "SASLMessageDefinitions.h"
 
+const char * marker_objPath = "jetway_marker/jetway_marker.obj";
+
+static XPLMObjectRef _markerObjectRef = nullptr;
+static XPLMInstanceRef _markerInstanceRef = nullptr;
 
 #define earth_rad   6378145.0
 
-static inline void
-pl21_XPLMWorldToLocal(double lat, double lon, double ele,
-    double *x, double *y, double *z)
+const double METERS_PER_FOOT = 0.3048;
+
+static inline const char *acf_find_prop(const acf_file_t *acf, const std::string property)
 {
-    double ref_lat, ref_lon, ref_elev;
-    double rad;
-    double del_lon_rad, act_lat_rad;
-    double sin_del_lon, cos_del_lon;
-    double sin_act_lat, cos_act_lat;
-    double sin_ref_lat, cos_ref_lat;
-    double x_e, y_e, z_e;
-
-    ASSERT(x != NULL);
-    ASSERT(y != NULL);
-    ASSERT(z != NULL);
-
-    XPLMLocalToWorld(0, 0, 0, &ref_lat, &ref_lon, &ref_elev);
-
-    rad = earth_rad + ele;
-    del_lon_rad = DEG2RAD(lon) - DEG2RAD(ref_lon);
-    act_lat_rad = DEG2RAD(lat);
-
-    sin_del_lon = sinl(del_lon_rad);
-    cos_del_lon = cosl(del_lon_rad);
-    sin_act_lat = sinl(act_lat_rad);
-    cos_act_lat = cosl(act_lat_rad);
-
-    sin_ref_lat = sinl(DEG2RAD(ref_lat));
-    cos_ref_lat = cosl(DEG2RAD(ref_lat));
-
-    x_e = rad * (sin_del_lon * cos_act_lat);
-    y_e = rad * (cos_del_lon * cos_act_lat) - earth_rad * cos_ref_lat;
-    z_e = rad * (-sin_act_lat) + earth_rad * sin_ref_lat;
-
-    *x = x_e;
-    *y = y_e * cos_ref_lat - z_e * sin_ref_lat;
-    *z = z_e * cos_ref_lat + y_e * sin_ref_lat;
+	return acf_prop_find(acf, property.c_str());
 }
 
-static inline void
-pl21_XPLMLocalToWorld(double x, double y, double z,
-    double *lat, double *lon, double *ele)
-{
-    double ref_lat, ref_lon, ref_elev;
-    double sin_ref_lat, cos_ref_lat;
-    double x_e, y_e, z_e, rad;
-
-    ASSERT(lat != NULL);
-    ASSERT(lon != NULL);
-    ASSERT(ele != NULL);
-
-    XPLMLocalToWorld(0, 0, 0, &ref_lat, &ref_lon, &ref_elev);
-
-    sin_ref_lat = sinl(DEG2RAD(ref_lat));
-    cos_ref_lat = cosl(DEG2RAD(ref_lat));
-    x_e = x;
-    y_e = y * cos_ref_lat + z * sin_ref_lat + earth_rad * cos_ref_lat;
-    z_e = z * cos_ref_lat - y * sin_ref_lat - earth_rad * sin_ref_lat;
-    rad = sqrtl(x_e * x_e + y_e * y_e + z_e * z_e);
-
-    *ele = rad - earth_rad;
-    *lat = RAD2DEG(asinl(-z_e / rad));
-    *lon = RAD2DEG(atan2l(x_e, y_e)) + ref_lon;
+// Turns a heading between [0, 360] into one between [-180, 180]
+static inline double
+shift_normalized_hdg(double hdg) {
+	if (hdg > 180) {
+		hdg -= 360;
+	} else if (hdg < -180) {
+		hdg += 360;
+	}
+	if (hdg > 180) hdg = 180;
+	if (hdg < -180) hdg = -180;
+	return hdg;
 }
 
 static bool notYetFullyLoaded = true;
@@ -155,8 +116,38 @@ static dr_t draw_object_x_dr, draw_object_y_dr, draw_object_z_dr, draw_object_ps
 
 static dr_t local_x_dr, local_y_dr, local_z_dr;
 static dr_t q_dr, lat_ref_dr, lon_ref_dr;
+static dr_t true_psi_dr;
 
-static double aircraftLat, aircraftLon, aircraftAlt;
+static double aircraftLat, aircraftLon, aircraftAlt, aircraftHdg;
+
+static XPLMProbeRef _terrainProbe;
+static XPLMProbeInfo_t _terrainProbeInfo;
+
+typedef enum DoorType
+{
+    LF1Door,
+    LF2Door,
+    LR1Door,
+    OTHERDoor
+} DoorType;
+
+typedef struct door_info_s {
+	float axialShift;
+	float lateralShift;
+	float verticalShift;
+	float hdgOffset; // Door might be on curved part of aircraft
+	double lat;
+	double lon;
+	double alt;
+	float  hdg;
+	DoorType type;
+} door_info_t;
+
+static bool has_board_1 = false;
+static bool has_board_2 = false;
+static door_info_t door_1;
+static door_info_t door_2;
+
 
 
 template<typename T>
@@ -212,6 +203,8 @@ typedef struct jetway_info_s {
 	float maxExtent;
 	float minWheels;
 	float maxWheels;
+
+	XPLMInstanceRef markerInstanceRef;
 } jetway_info_t;
 
 static jetway_info_t* nearest_jetway = nullptr;
@@ -238,17 +231,14 @@ void slide_back_and_forth(float *current, float *target, float lower, float uppe
 
 void random_animate_jetway(jetway_info_t *jetway) {
 
-	double bearing_from_rotunda_to_aircraft = gc_point_hdg(GEO_POS2(jetway->lat, jetway->lon), GEO_POS2(aircraftLat, aircraftLon));
-	
-	//slide_back_and_forth(&jetway->rotate1, &jetway->rotate1_target, jetway->minRot1, jetway->maxRot1, 0.01);
-	
-	jetway->rotate1 = normalize_hdg(bearing_from_rotunda_to_aircraft - jetway->hdg);
-
-	slide_back_and_forth(&jetway->rotate2, &jetway->rotate2_target, jetway->minRot2, jetway->maxRot2, 0.0123);
-	slide_back_and_forth(&jetway->rotate3, &jetway->rotate3_target, jetway->minRot3, jetway->maxRot3, 0.0217);
-	
-	slide_back_and_forth(&jetway->extent, &jetway->extent_target, jetway->minExtent, jetway->maxExtent, 0.0179);
-
+	if (jetway->rotate2 != jetway->rotate2_target) {
+		slide_to(&jetway->rotate2, jetway->rotate2_target, 0.217);
+	} else if (jetway->rotate1 != jetway->rotate1_target) {
+		slide_to(&jetway->rotate1, jetway->rotate1_target, 0.0317);
+	} else {
+		slide_to(&jetway->rotate3, jetway->rotate3_target, 0.00217);
+		slide_to(&jetway->extent, jetway->extent_target, 0.0179);
+	}
 	// Handle the wheel pillar...
 
 	// wheelPos is the distance of the wheel pillar from the rotunda...
@@ -304,7 +294,9 @@ jetway_info_t* jetway_found_sam_xml(std::pair<float, float> spot, float targetHd
 
 	float nearest_distance = 5*tolerance;
     jetway_info_t* candidate_jetway = nullptr;
-	const float hdgTolerance = 3.0f;
+	const float hdgTolerance = 180.0f;
+
+	float candidate_jetway_hdg_difference = 0;
 
 	std::vector<std::pair<double, jetway_info_t*>> nearbyDistJetways = jetways_within_range_in_map(spot, 5*tolerance, samXMLjetways);
 
@@ -315,16 +307,21 @@ jetway_info_t* jetway_found_sam_xml(std::pair<float, float> spot, float targetHd
     	logMsg("[DEBUG] Distance found is %f meters", distJetway.first);
 
     	if (distJetway.first < nearest_distance) {
-    		float headingDifference = normalize_hdg(std::abs(distJetway.second->hdg - targetHdg));
+    		float headingDifference = std::abs(shift_normalized_hdg(normalize_hdg(distJetway.second->hdg - targetHdg)));
     		if (headingDifference < hdgTolerance) {
 	    		nearest_distance = distJetway.first;
-    			candidate_jetway = distJetway.second;	
+    			candidate_jetway = distJetway.second;
+    			candidate_jetway_hdg_difference = headingDifference;
         	} else {
         		logMsg("[WARN] Found closer possible jetway %s but heading differs by %f, more than %f degrees!", distJetway.second->name.c_str(), headingDifference, hdgTolerance);
         	}
         } else {
         	logMsg("[WARN] Jetway %s is not closer", distJetway.second->name.c_str());
         }	
+    }
+
+    if (candidate_jetway) { 
+    	logMsg("[INFO] Found closest possible SAM jetway %s, heading differs by %f degrees!", candidate_jetway->name.c_str(), candidate_jetway_hdg_difference);	
     }
 
     return candidate_jetway;
@@ -346,7 +343,7 @@ bool_t jetway_rotate1_r_cb(dr_t *dr, void *valueout)
 	
 	double worldLatitude, worldLongitude, worldAltitude;
 
-	pl21_XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
+	XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
                           dr_getf(&draw_object_y_dr),    
                           dr_getf(&draw_object_z_dr),    
                           &worldLatitude,  
@@ -361,7 +358,7 @@ bool_t jetway_rotate1_r_cb(dr_t *dr, void *valueout)
 
 	if (!foundJetway) {
 
-		foundJetway = jetway_found_sam_xml(spot, drawObjectHeading, 50.0);
+		foundJetway = jetway_found_sam_xml(spot, drawObjectHeading, 150.0);
 
 		jetway_info_t newJetway;
 
@@ -417,10 +414,20 @@ bool_t jetway_rotate1_r_cb(dr_t *dr, void *valueout)
 
 	} else {
 		
+		// Lets use the precision of the sim... greater than the xml file!
+		foundJetway->lat = worldLatitude;
+		foundJetway->lon = worldLongitude;
+		foundJetway->alt = worldAltitude;
+		foundJetway->hdg = dr_getf(&draw_object_psi_dr);
+
 		if (foundJetway == nearest_jetway) {
 			random_animate_jetway(foundJetway);
 		} else {
 			foundJetway->rotate1 = foundJetway->initialRot1;
+			foundJetway->rotate2 = foundJetway->initialRot2;
+			foundJetway->rotate3 = foundJetway->initialRot3;
+			foundJetway->extent  = foundJetway->initialExtent;
+			foundJetway->wheels = (foundJetway->wheelPos + foundJetway->extent) * sin(DEG2RAD(foundJetway->rotate3));
 		}
 
 		*((float*) valueout) = foundJetway->rotate1;
@@ -435,7 +442,7 @@ bool_t jetway_rotate2_r_cb(dr_t *dr, void *valueout)
 	
 	double worldLatitude, worldLongitude, worldAltitude;
 
-	pl21_XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
+	XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
                           dr_getf(&draw_object_y_dr),    
                           dr_getf(&draw_object_z_dr),    
                           &worldLatitude,  
@@ -459,7 +466,7 @@ bool_t jetway_rotate3_r_cb(dr_t *dr, void *valueout)
 	
 	double worldLatitude, worldLongitude, worldAltitude;
 
-	pl21_XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
+	XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
                           dr_getf(&draw_object_y_dr),    
                           dr_getf(&draw_object_z_dr),    
                           &worldLatitude,  
@@ -484,7 +491,7 @@ bool_t jetway_extent_r_cb(dr_t *dr, void *valueout)
 	
 	double worldLatitude, worldLongitude, worldAltitude;
 
-	pl21_XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
+	XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
                           dr_getf(&draw_object_y_dr),    
                           dr_getf(&draw_object_z_dr),    
                           &worldLatitude,  
@@ -509,7 +516,7 @@ bool_t jetway_wheels_r_cb(dr_t *dr, void *valueout)
 	
 	double worldLatitude, worldLongitude, worldAltitude;
 
-	pl21_XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
+	XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
                           dr_getf(&draw_object_y_dr),    
                           dr_getf(&draw_object_z_dr),    
                           &worldLatitude,  
@@ -532,7 +539,7 @@ bool_t jetway_wheelrotate_r_cb(dr_t *dr, void *valueout)
 
 	double worldLatitude, worldLongitude, worldAltitude;
 
-	pl21_XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
+	XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
                           dr_getf(&draw_object_y_dr),    
                           dr_getf(&draw_object_z_dr),    
                           &worldLatitude,  
@@ -563,7 +570,7 @@ bool_t jetway_wheelrotatec_r_cb(dr_t *dr, void *valueout)
 	
 	double worldLatitude, worldLongitude, worldAltitude;
 
-	pl21_XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
+	XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
                           dr_getf(&draw_object_y_dr),    
                           dr_getf(&draw_object_z_dr),    
                           &worldLatitude,  
@@ -587,7 +594,7 @@ bool_t jetway_warnlight_r_cb(dr_t *dr, void *valueout)
 	
 	double worldLatitude, worldLongitude, worldAltitude;
 
-	pl21_XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
+	XPLMLocalToWorld(dr_getf(&draw_object_x_dr),    
                           dr_getf(&draw_object_y_dr),    
                           dr_getf(&draw_object_z_dr),    
                           &worldLatitude,  
@@ -639,6 +646,20 @@ void parseSAMxmlFile(std::string path)
 			continue;
 		}
 		
+		// if (jetwayXMLelem->Attribute("latitude")) {
+		// 	newSAMxmlJetway.lat = std::stod(std::string(jetwayXMLelem->Attribute("latitude")));
+		// } else {
+		// 	logMsg("[ERROR] Couldn't find latitude!");
+		// 	continue;
+		// }
+
+		// if (jetwayXMLelem->Attribute("longitude")) {
+		// 	newSAMxmlJetway.lon = std::stod(std::string(jetwayXMLelem->Attribute("longitude")));
+		// } else {
+		// 	logMsg("[ERROR] Couldn't find longitude!");
+		// 	continue;
+		// }
+
 		errretval = jetwayXMLelem->QueryDoubleAttribute("latitude", &newSAMxmlJetway.lat);
 		if (errretval != tinyxml2::XML_SUCCESS) {
 			logMsg("[ERROR] Couldn't find latitude!");
@@ -786,6 +807,8 @@ void parseSAMxmlFile(std::string path)
 		newSAMxmlJetway.extent = newSAMxmlJetway.initialExtent;
 		newSAMxmlJetway.wheelrotatec = newSAMxmlJetway.initialWheelRotateC;
 
+		newSAMxmlJetway.markerInstanceRef = NULL;
+
 		auto spot = std::make_pair(newSAMxmlJetway.lat, newSAMxmlJetway.lon);
 
 		samXMLjetways[spot] = newSAMxmlJetway;
@@ -819,6 +842,115 @@ void findSAMxmlFilesInCustomSceneries()
 
 	logMsg("[INFO] Found a total of %d SAM jetways in all sam.xml files globally", samXMLjetways.size());
 }
+
+
+static double manualMarkerLat = 52.308887427053648;
+static double manualMarkerLon = 4.7675393140753757;
+static dr_t samiam_manual_marker_lat, samiam_manual_marker_lon;
+XPLMInstanceRef _manualMarkerInstanceRef = nullptr;
+
+void setMarkerPosition()
+{
+    if (!_markerObjectRef) {
+    	return;
+    }
+        
+    if(!_markerInstanceRef)
+    {
+        const char* datarefs[1];
+        datarefs[0] = nullptr;
+        _markerInstanceRef = XPLMCreateInstance(_markerObjectRef, datarefs);
+
+        if (_markerInstanceRef == NULL) {
+            logMsg("Could not create marker instance.");
+            XPLMUnloadObject(_markerObjectRef);
+            _markerObjectRef = nullptr;
+        } else {
+            logMsg("Marker instance creation succeeded.");
+        }
+    }
+
+    if(_markerInstanceRef)
+    {
+        logMsg("Setting jetway marker position for jetway %s ...", nearest_jetway->name.c_str());
+        XPLMDrawInfo_t drawInfo;
+        drawInfo.structSize = sizeof(XPLMDrawInfo_t);
+
+		double local_x_jetway, local_y_jetway, local_z_jetway;
+        
+        XPLMWorldToLocal(nearest_jetway->lat,  
+                              nearest_jetway->lon,    
+                              nearest_jetway->alt + nearest_jetway->height + 2,    
+                              &local_x_jetway,    
+                              &local_y_jetway,    
+                              &local_z_jetway); 
+
+        drawInfo.x = local_x_jetway;
+        drawInfo.y = local_y_jetway;
+        drawInfo.z = local_z_jetway;
+        drawInfo.pitch = 0;
+        drawInfo.roll = 0;
+        drawInfo.heading = nearest_jetway->hdg;
+        XPLMInstanceSetPosition(_markerInstanceRef, &drawInfo, nullptr);
+    }
+}
+
+void setManualMarkerPosition()
+{
+    if (!_markerObjectRef) {
+    	return;
+    }
+        
+    if(!_manualMarkerInstanceRef)
+    {
+        const char* datarefs[1];
+        datarefs[0] = nullptr;
+        _manualMarkerInstanceRef = XPLMCreateInstance(_markerObjectRef, datarefs);
+
+        if (_manualMarkerInstanceRef == NULL) {
+            logMsg("Could not create manual marker instance.");
+        } else {
+            logMsg("Manual marker instance creation succeeded.");
+        }
+    }
+
+    if(_manualMarkerInstanceRef)
+    {
+        logMsg("Setting manual marker position to %f, %f", manualMarkerLat, manualMarkerLon);
+        XPLMDrawInfo_t drawInfo;
+        drawInfo.structSize = sizeof(XPLMDrawInfo_t);
+
+		double local_x_marker, local_y_marker, local_z_marker;
+        
+        XPLMWorldToLocal(manualMarkerLat,  
+                              manualMarkerLon,    
+                              aircraftAlt + 2,    
+                              &local_x_marker,    
+                              &local_y_marker,    
+                              &local_z_marker); 
+
+        drawInfo.x = local_x_marker;
+        drawInfo.y = local_y_marker;
+        drawInfo.z = local_z_marker;
+        drawInfo.pitch = 0;
+        drawInfo.roll = 0;
+        drawInfo.heading = 0;
+        XPLMInstanceSetPosition(_manualMarkerInstanceRef, &drawInfo, nullptr);
+    }
+}
+
+
+void load_marker_object_cb(XPLMObjectRef inObject, void *inRefcon)
+{
+    logMsg("Avatar object loaded successfully.");
+    _markerObjectRef = inObject;  
+
+    if (nearest_jetway) {
+    	setMarkerPosition();
+    } 
+}
+
+
 
 
 /*
@@ -899,9 +1031,14 @@ PLUGIN_API int XPluginStart(
 	fdr_find(&local_z_dr, "sim/flightmodel/position/local_z");
 
 	fdr_find(&q_dr , "sim/flightmodel/position/q");
+	fdr_find(&true_psi_dr, "sim/flightmodel/position/true_psi");
 
 	fdr_find(&lat_ref_dr, "sim/flightmodel/position/lat_ref");
 	fdr_find(&lon_ref_dr, "sim/flightmodel/position/lon_ref");
+
+	_terrainProbe = XPLMCreateProbe(xplm_ProbeY);
+	_terrainProbeInfo.structSize = (int) sizeof(XPLMProbeInfo_t);
+
 
 	dr_create_f(&sam_jetway_rotate1_dr, NULL, B_FALSE, "sam/jetway/rotate1");
 	sam_jetway_rotate1_dr.write_scalar_cb = jetway_w_cb;
@@ -939,6 +1076,10 @@ PLUGIN_API int XPluginStart(
 	sam_jetway_warnlight_dr.write_scalar_cb = jetway_w_cb;
 	sam_jetway_warnlight_dr.read_scalar_cb = jetway_warnlight_r_cb;
 
+
+	dr_create_f64(&samiam_manual_marker_lat, &manualMarkerLat, B_TRUE, "samiam/marker/manual/lat");
+	dr_create_f64(&samiam_manual_marker_lon, &manualMarkerLon, B_TRUE, "samiam/marker/manual/lon");
+
 	// This FLCB will register our custom dataref in DRE
 	//XPLMRegisterFlightLoopCallback(DataRefEditorRegistrationFlightLoopCallback, 1, NULL);   
 	
@@ -947,9 +1088,112 @@ PLUGIN_API int XPluginStart(
 
 	findSAMxmlFilesInCustomSceneries();
 
+
+	/************ LOAD MARKER OBJECT *************/
+
+	char tempCharPath[4096];
+    
+    XPLMPluginID myPluginID = XPLMGetMyID();
+    
+    XPLMGetPluginInfo( myPluginID, NULL, tempCharPath, NULL, NULL);
+    
+    //CONCERN: This function causes X-Plane to crash?
+    //fix_pathsep(tempCharPath);
+        
+    const char *os_sep = "/";
+
+    size_t numOfPathParts;
+    
+    std::string pluginPath;
+
+    char **pathSplitString = strsplit(tempCharPath, os_sep, B_TRUE, &numOfPathParts);
+        
+    for (int i = 0; i < numOfPathParts-2; i++) {
+#if IBM 
+        if (i > 0) pluginPath += os_sep; //std::string(os_sep);
+#else 
+        pluginPath += os_sep;
+#endif
+        pluginPath += pathSplitString[i];
+    }
+
+    free_strlist(pathSplitString, numOfPathParts);
+
+    char *jetway_marker_object_path = mkpathname(pluginPath.c_str(), marker_objPath, NULL);
+
+    logMsg("Attempting deferred load of avatar object at path: %s", jetway_marker_object_path);
+
+    XPLMLoadObjectAsync(jetway_marker_object_path, load_marker_object_cb, NULL); 
+
+    free(jetway_marker_object_path);
+
 	return 1;
 }
 
+void readAircraftDoorProperties()
+{
+	static char aircraftPath[4096];
+    static char aircraftFileName[1024];
+
+    XPLMGetNthAircraftModel(0, aircraftFileName, aircraftPath); 
+
+    // TODO: Lets first look for a livery specific samiam.xml file
+    //       then look for aircraft folder samiam.xml file
+    //       then maybe some kind of global info we ship with the plugin
+    //       then and only then read the acf info?
+
+    //       samiam.xml file could contain info about which doors to use
+    //       if one or two jetways present and so on and so forth...
+
+	acf_file_t *acf = acf_file_read(aircraftPath);
+    
+	if(acf) {
+
+		float cgY_m = METERS_PER_FOOT * std::stof(acf_find_prop(acf, "acf/_cgY"));
+		float cgZ_m = METERS_PER_FOOT * std::stof(acf_find_prop(acf, "acf/_cgZ"));
+
+
+		const char *acf_prop = nullptr;
+
+		if (acf_prop = acf_find_prop(acf, "acf/_has_board_1")) {
+			has_board_1 = (std::stoi(acf_prop) == 1);
+			if (has_board_1) {
+				if (acf_prop = acf_find_prop(acf, "acf/_board_1/0")) {
+					door_1.lateralShift = METERS_PER_FOOT * std::stof(acf_prop);
+					door_1.verticalShift = METERS_PER_FOOT * std::stof(acf_find_prop(acf, "acf/_board_1/1")) - cgY_m;
+					door_1.axialShift = METERS_PER_FOOT * std::stof(acf_find_prop(acf, "acf/_board_1/2")) - cgZ_m;
+					door_1.hdgOffset = 0;
+					door_1.type = LF1Door;
+				} else {
+					has_board_1 = false;
+				}
+			}
+		} else {
+			has_board_1 = false;
+		}
+
+		if (acf_prop = acf_find_prop(acf, "acf/_has_board_2")) {
+			has_board_2 = (std::stoi(acf_prop) == 1);
+			if (has_board_2) {
+				if (acf_prop = acf_find_prop(acf, "acf/_board_2/0")) {
+					door_2.lateralShift = METERS_PER_FOOT * std::stof(acf_prop);
+					door_2.verticalShift = METERS_PER_FOOT * std::stof(acf_find_prop(acf, "acf/_board_2/1")) - cgY_m;
+					door_2.axialShift = METERS_PER_FOOT * std::stof(acf_find_prop(acf, "acf/_board_2/2")) - cgZ_m;
+					door_2.hdgOffset = 0;
+					door_2.type = LF2Door;
+				} else {
+					has_board_2 = false;
+				}
+			}
+		} else {
+			has_board_1 = false;
+		}
+	}
+
+	acf_file_free(acf);
+
+	logMsg("[DEBUG] Has board 1: %d and axial shift = %f, lateral shit = %f and vertical shift = %f", has_board_1, door_1.axialShift, door_1.lateralShift, door_1.verticalShift);
+}
 
 float DataRefEditorRegistrationFlightLoopCallback(float elapsedme, float elapsedSim, int counter, void * refcon)
 {
@@ -961,6 +1205,75 @@ float DataRefEditorRegistrationFlightLoopCallback(float elapsedme, float elapsed
     return 0.0f;  // Flight loop is called only once!
 }
 
+void setSAMmarkerPositions() {
+
+	for (auto& [spot, jetway] : samXMLjetways) {
+
+		if(!jetway.markerInstanceRef)
+	    {
+	        const char* datarefs[1];
+	        datarefs[0] = nullptr;
+	        jetway.markerInstanceRef = XPLMCreateInstance(_markerObjectRef, datarefs);
+
+	        if (jetway.markerInstanceRef == NULL) {
+	            logMsg("Could not create SAM jetway marker instance.");
+	        } else {
+	            logMsg("SAM jetway marker instance creation succeeded.");
+	        }
+	    }
+
+	    if(jetway.markerInstanceRef)
+	    {
+	        logMsg("Setting jetway marker position for jetway %s ...", jetway.name.c_str());
+	        XPLMDrawInfo_t drawInfo;
+	        drawInfo.structSize = sizeof(XPLMDrawInfo_t);
+
+			double local_x_jetway, local_y_jetway, local_z_jetway;
+	        
+	        XPLMWorldToLocal(jetway.lat,  
+	                              jetway.lon,    
+	                              jetway.alt + jetway.height + 2,    
+	                              &local_x_jetway,    
+	                              &local_y_jetway,    
+	                              &local_z_jetway); 
+
+	        XPLMProbeResult probe_result = XPLMProbeTerrainXYZ(_terrainProbe,
+	          (float) local_x_jetway,
+	          (float) local_y_jetway,
+	          (float) local_z_jetway,
+	          &_terrainProbeInfo);
+
+		    double rotundaBaseLatitude, rotundaBaseLongitude, rotundaBaseMSL;
+	        XPLMLocalToWorld(_terrainProbeInfo.locationX,    
+	                         _terrainProbeInfo.locationY,    
+	                         _terrainProbeInfo.locationZ,    
+	                         &rotundaBaseLatitude,  
+	                         &rotundaBaseLongitude,    
+	                         &rotundaBaseMSL);
+
+	        jetway.alt = rotundaBaseMSL;
+
+	        double local_x_jetway2, local_y_jetway2, local_z_jetway2;
+
+	        XPLMWorldToLocal(jetway.lat,  
+	                              jetway.lon,    
+	                              jetway.alt + jetway.height + 2,    
+	                              &local_x_jetway2,    
+	                              &local_y_jetway2,    
+	                              &local_z_jetway2); 
+
+
+	        drawInfo.x = local_x_jetway;
+	        drawInfo.y = local_y_jetway;
+	        drawInfo.z = local_z_jetway2;
+	        drawInfo.pitch = 0;
+	        drawInfo.roll = 0;
+	        drawInfo.heading = jetway.hdg;
+	        XPLMInstanceSetPosition(jetway.markerInstanceRef, &drawInfo, nullptr);
+
+	    }
+	}
+}
 
 float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * refcon)
 {
@@ -989,18 +1302,19 @@ float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * 
     double local_y = dr_getf(&local_y_dr);
     double local_z = dr_getf(&local_z_dr);
 
+    // Get the aircraft true heading...
+    aircraftHdg = dr_getf(&true_psi_dr);
+
+
     double dx, dy, dz;
    
-    pl21_XPLMLocalToWorld(local_x,    
+    XPLMLocalToWorld(local_x,    
                          local_y,    
                          local_z,    
                          &aircraftLat,  
                          &aircraftLon,    
                          &aircraftAlt);
 
-    // Find jetways that are within 200m of aircraft...
-    float range = 200.0f;
-    std::vector<std::pair<double, jetway_info_t*>> nearbyJetways = jetways_within_range(std::make_pair(aircraftLat, aircraftLon), range);
 
     /* Project into aircraft oriented frame.... */
     
@@ -1027,17 +1341,52 @@ float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * 
     /* Used for projection of aircraft position and velocity errors into aircraft frame */ 
     struct quat ecmigl_2_local_quat = quat_ecmigl2local(GEO_POS2(lat_ref, lon_ref), 0);
     
-    //struct quat local_pilot_quat = {_pilotInputInfo.q[1], _pilotInputInfo.q[2], _pilotInputInfo.q[3], _pilotInputInfo.q[0]};
     struct quat acf_q_local = quat_rot_concat(ecmigl_2_local_quat, acf_q_earth_fixed);
 
+
+
+
+    door_info_t *target_door = &door_1;
+
+    // Make this a function that is door specific...
+
+    
+
+    struct quat body_frame_shift_vector = quat_from_vect3l_gl(VECT3L(target_door->lateralShift, target_door->verticalShift, target_door->axialShift));
+
+    struct quat recovered_local_difference_vector = squat_multiply(acf_q_local, squat_multiply(body_frame_shift_vector, squat_inverse(acf_q_local)));
+    vect3l_t vxyz_recovered_vect3 = quat_to_vect3l_gl(recovered_local_difference_vector);
+        
+    double local_x_value_shift = vxyz_recovered_vect3.x;
+    double local_y_value_shift = vxyz_recovered_vect3.y;
+    double local_z_value_shift = vxyz_recovered_vect3.z;
+
+    XPLMLocalToWorld(local_x + local_x_value_shift,    
+                          local_y + local_y_value_shift,    
+                          local_z + local_z_value_shift,    
+                          &target_door->lat,  
+                          &target_door->lon,    
+                          &target_door->alt);
+
+    
+    target_door->hdg = aircraftHdg + target_door->hdgOffset;
+
+
+    // Find jetways that are within 200m of aircraft...
+    float range = 200.0f;
+    std::vector<std::pair<double, jetway_info_t*>> nearbyJetways = jetways_within_range(std::make_pair(target_door->lat, target_door->lon), range);
+
+    
     float nearest_distance_sqrd = 2 * range * range;
     nearest_jetway = nullptr;
+
+    double local_x_nearest_jetway, local_y_nearest_jetway, local_z_nearest_jetway;
 
     for (auto& distJetway : nearbyJetways) {
 
     	double local_x_jetway, local_y_jetway, local_z_jetway;
         
-        pl21_XPLMWorldToLocal(distJetway.second->lat,  
+        XPLMWorldToLocal(distJetway.second->lat,  
                               distJetway.second->lon,    
                               distJetway.second->alt,    
                               &local_x_jetway,    
@@ -1061,23 +1410,127 @@ float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * 
         	if (jetway_dist_sqrd < nearest_distance_sqrd) {
         		nearest_distance_sqrd = jetway_dist_sqrd;
         		nearest_jetway = distJetway.second;
+        		
+        		local_x_nearest_jetway = local_x_jetway;
+        		local_y_nearest_jetway = local_y_jetway;
+        		local_z_nearest_jetway = local_z_jetway;
+
+        		
+
         		//logMsg("[DEBUG] Candidate jetway %s to the left of aircraft at distance of %f meters", nearest_jetway->name.c_str(), std::sqrt(nearest_distance_sqrd));
         	}
         }	
     }
 
     if (nearest_jetway) {
-    	logMsg("[DEBUG] Found jetway %s to the left of aircraft at distance of %f meters", nearest_jetway->name.c_str(), std::sqrt(nearest_distance_sqrd));
-    	logMsg("[DEBUG] Jetway %s has the following params:\n", nearest_jetway->name.c_str());
-    	logMsg("[DEBUG] minRot3: %f", nearest_jetway->minRot3);
-    	logMsg("[DEBUG] maxRot3: %f", nearest_jetway->maxRot3);
-    	logMsg("[DEBUG] minWheels: %f", nearest_jetway->minWheels);
-    	logMsg("[DEBUG] wheelPos: %f", nearest_jetway->wheelPos);
+    	logMsg("[DEBUG] Found jetway %s to the left of aircraft at distance of %f meters has the following params:", nearest_jetway->name.c_str(), std::sqrt(nearest_distance_sqrd));
+    	logMsg("[DEBUG] latitude: %f", nearest_jetway->lat);
+    	logMsg("[DEBUG] longitude: %f", nearest_jetway->lon);
+    	logMsg("[DEBUG] heading: %f", nearest_jetway->hdg);
+    	//logMsg("[DEBUG] minRot3: %f", nearest_jetway->minRot3);
+    	//logMsg("[DEBUG] maxRot3: %f", nearest_jetway->maxRot3);
+    	//logMsg("[DEBUG] minWheels: %f", nearest_jetway->minWheels);
+    	//logMsg("[DEBUG] wheelPos: %f", nearest_jetway->wheelPos);
     }
 
+    
+
+    if (nearest_jetway) {
+	    
+	    setMarkerPosition();
+    	
+
+	    XPLMProbeResult probe_result = XPLMProbeTerrainXYZ(_terrainProbe,
+          (float) local_x_nearest_jetway,
+          (float) local_y_nearest_jetway,
+          (float) local_z_nearest_jetway,
+          &_terrainProbeInfo);
+
+	    double rotundaBaseLatitude, rotundaBaseLongitude, rotundaBaseMSL;
+        XPLMLocalToWorld(_terrainProbeInfo.locationX,    
+                         _terrainProbeInfo.locationY,    
+                         _terrainProbeInfo.locationZ,    
+                         &rotundaBaseLatitude,  
+                         &rotundaBaseLongitude,    
+                         &rotundaBaseMSL);
+
+
+    	// Need to calculate the lat and lon of where the cabin should be...
+
+    	// If door .hdgOffset = 0 then we apply a negative (for left door) lateral offset of the cabinLength...
+    	// in the aircraft coordinates.  If .hdgOffset > 0 then we do cos() that for lateral and -sin() for axial...
+
+    	struct quat cabin_body_frame_shift_vector 
+    				= quat_from_vect3l_gl(VECT3L(-nearest_jetway->cabinLength*cos(DEG2RAD(target_door->hdgOffset)), 
+    											 0, -nearest_jetway->cabinLength*sin(DEG2RAD(target_door->hdgOffset))));
+
+	    struct quat cabin_recovered_local_difference_vector = squat_multiply(acf_q_local, squat_multiply(cabin_body_frame_shift_vector, squat_inverse(acf_q_local)));
+	    vect3l_t cabin_vxyz_recovered_vect3 = quat_to_vect3l_gl(cabin_recovered_local_difference_vector);
+	        
+	    double local_x_value_shift = vxyz_recovered_vect3.x;
+	    double local_y_value_shift = vxyz_recovered_vect3.y;
+	    double local_z_value_shift = vxyz_recovered_vect3.z;
+
+	    double cabin_1_lat, cabin_1_lon, cabin_1_alt;
+
+	    XPLMLocalToWorld(local_x + local_x_value_shift + cabin_vxyz_recovered_vect3.x,    
+	                          local_y + local_y_value_shift + cabin_vxyz_recovered_vect3.y,    
+	                          local_z + local_z_value_shift + cabin_vxyz_recovered_vect3.z,    
+	                          &cabin_1_lat,  
+	                          &cabin_1_lon,    
+	                          &cabin_1_alt);
+
+		//logMsg("[DEBUG] Aircraft alt is %f, door alt is %f, door vertical shift is %f", aircraftAlt, target_door->alt, target_door->verticalShift);
+
+	    //logMsg("[DEBUG] Cabin 1 alt is %f", cabin_1_alt);
+
+	    //logMsg("[DEBUG] Rotunda base is at alt %f meters msl", rotundaBaseMSL);
+
+		geo_pos2_t rotunda_geo_pos2 = GEO_POS2(nearest_jetway->lat, nearest_jetway->lon);
+		geo_pos2_t cabin_geo_pos2 = GEO_POS2(cabin_1_lat, cabin_1_lon);	                          
+
+	    double bearing_from_rotunda_to_cabin = gc_point_hdg(rotunda_geo_pos2, cabin_geo_pos2);
+	
+	    nearest_jetway->rotate1_target = shift_normalized_hdg(normalize_hdg(bearing_from_rotunda_to_cabin - nearest_jetway->hdg));
+
+		nearest_jetway->rotate2_target = shift_normalized_hdg(normalize_hdg(90 - (nearest_jetway->hdg + nearest_jetway->rotate1_target) + target_door->hdg));
+		//logMsg("[DEBUG] Rotate 2 target is %f degrees", nearest_jetway->rotate2_target );
+
+		// CONCERN: I think we should just convert the jetway position to local_x, local_y, local_z
+		//          and use those and the shifts above to in opengl coordinates calculate these distances?
+
+		double heightRise = cabin_1_alt - nearest_jetway->height - rotundaBaseMSL;
+
+		//logMsg("[DEBUG] Height rise is %f", heightRise);
+
+		double distance_from_rotunda_to_cabin = gc_distance(rotunda_geo_pos2, cabin_geo_pos2); 
+		
+
+		nearest_jetway->extent_target = std::sqrt(heightRise*heightRise + 
+			                                      distance_from_rotunda_to_cabin*distance_from_rotunda_to_cabin)
+											 - nearest_jetway->cabinPos;
+
+		if (nearest_jetway->extent_target + nearest_jetway->cabinPos != 0) {
+			nearest_jetway->rotate3_target = RAD2DEG(std::asin(heightRise/(nearest_jetway->extent_target + nearest_jetway->cabinPos)));
+		} else {
+			logMsg("[ERROR] Can't calculate rotate3 target because extent target + cabin position sums to zero, would have divide by zero!");
+			nearest_jetway->rotate3_target = 0;
+		}
+
+	}
+
+	
+	if (_markerObjectRef) {
+		setManualMarkerPosition();
+
+		setSAMmarkerPositions();
+	}
+
 	//Return the interval we next want to be called in..
-	return 5.0f;
+	return 1.0f;
 }
+
+
 
 
 /**********************************************/
@@ -1103,6 +1556,10 @@ PLUGIN_API void	XPluginStop(void)
 	dr_delete(&sam_jetway_wheelrotater_dr);
 	dr_delete(&sam_jetway_wheelrotatec_dr);
 	dr_delete(&sam_jetway_warnlight_dr);
+
+	if (_markerObjectRef) {
+		XPLMUnloadObject(_markerObjectRef);
+	}
   
     notYetFullyLoaded = true;
 
@@ -1165,6 +1622,8 @@ PLUGIN_API void XPluginReceiveMessage(
     		//NOTE: This is an absurd aspect of the XPLM that a void* is actually an int!
     		if (inParam == 0) {
     			logMsg("Aircraft loaded...");
+
+    			readAircraftDoorProperties();
     		}
 
     		break; 
@@ -1251,3 +1710,23 @@ void menu_handler(void * in_menu_ref, void * in_item_ref)
 		
 	}
 }
+
+
+/* X-Plane 12 Native Jeways ....
+
+	sim/graphics/animation/jetways/jw_base_rotation	float	n		
+	sim/graphics/animation/jetways/jw_tunnel_pitch	float	n		
+	sim/graphics/animation/jetways/jw_tunnel_extension	float	n		
+	sim/graphics/animation/jetways/jw_cabin_rotation	float	n		
+	sim/graphics/animation/jetways/jw_bogie_elevation	float	n		
+	sim/graphics/animation/jetways/jw_bogie_rotation	float	n		
+	sim/graphics/animation/jetways/jw_bogie_bogie_tilt	float	n		
+	sim/graphics/animation/jetways/jw_wheel_left	float	n		
+	sim/graphics/animation/jetways/jw_wheel_right	float	n		
+	sim/graphics/animation/jetways/jw_stairs_angle	float	n		
+	sim/graphics/animation/jetways/jw_stairs_bogie_angle	float	n		
+	sim/graphics/animation/jetways/jw_is_moving
+
+NOTE THEY ARE NOT WRITABLE.  WHY NOT ALLOW US TO WRITE AND OVERRIDE BEHAVIOR?
+
+*/
