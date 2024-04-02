@@ -4,3 +4,6 @@
 [submodule "libquat"]
 	path = libquat
 	url = https://github.com/skiselkov/libquat.git
+[submodule "tinyxml2"]
+	path = tinyxml2
+	url = https://github.com/leethomason/tinyxml2
