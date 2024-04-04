@@ -33,6 +33,7 @@ extern "C" {
 
 #include <map>
 #include <vector>
+#include <deque>
 #include <string>
 #include <algorithm>
 
@@ -68,7 +69,7 @@ const char * marker_objPath = "jetway_marker/jetway_marker.obj";
 static XPLMObjectRef _markerObjectRef = nullptr;
 static XPLMInstanceRef _markerInstanceRef = nullptr;
 
-#define earth_rad   6378145.0
+const double KTS2MPS = 0.514444;
 
 const double METERS_PER_FOOT = 0.3048;
 
@@ -133,6 +134,11 @@ static dr_t gear_types_dr;
 static dr_t gear_steers_dr;
 static dr_t tire_z_dr;
 
+static dr_t beacon_on_dr;
+static dr_t fnrml_gear_dr;
+static dr_t groundspeed_dr;
+static dr_t engine_burning_fuel_dr;
+
 bool need_acf_properties = false;
 
 typedef std::pair<double, double> LatLonSpot;
@@ -143,10 +149,11 @@ static XPLMProbeInfo_t _terrainProbeInfo;
 
 typedef enum OpsState
 {
+	NOSTATE,
 	DISCONNECTED_TAXI_IN,
 	CONNECTING,
 	CONNECTED,
-	DISCONNECTED,
+	DISCONNECTING,
 	DISCONNECTED_TAXI_OUT
 } OpsState;
 
@@ -161,20 +168,13 @@ typedef enum DoorType
     OTHERDoor
 } DoorType;
 
-typedef struct door_info_s {
-	float axialShift;
-	float lateralShift;
-	float verticalShift;
-	float hdgOffset; // Door might be on curved part of aircraft
-	DoorType type;
-} door_info_t;
-
-static bool has_board_1 = false;
-static bool has_board_2 = false;
-static door_info_t door_1;
-static door_info_t door_2;
-
-
+typedef enum DoorConnection
+{
+    DOORDISCONNECTED,
+    DOORWILLCONNECT,
+    DOORJETWAYMOVING,
+    DOORCONNECTED
+} DoorConnection;
 
 template<typename T>
 bool fuzzyCompare(T a, T b, int k)
@@ -187,17 +187,52 @@ bool same_spot(LatLonSpot spot1, LatLonSpot spot2)
 	return fuzzyCompare(spot1.first, spot2.first, 4) && fuzzyCompare(spot1.second, spot2.second, 4);
 }
 
-typedef struct aircraft_info_s {
+struct aircraft_info_s;
+struct door_info_s;
+struct jetway_info_s;
+
+typedef aircraft_info_s aircraft_info_t;
+typedef door_info_s door_info_t;
+typedef jetway_info_s jetway_info_t;
+
+struct aircraft_info_s {
+	double local_x;
+	double local_y;
+	double local_z;
+	struct quat q_local;
 	double lat;
 	double lon;
 	double alt;
 	float hdg;
 	bool beacon;
 	bool engines;
+	bool airborne;
 	float velocity;
 	double nosewheelZ;
-	LatLonSpot nosewheelSpot; 
-} aircraft_info_t;
+	LatLonSpot nosewheelSpot;
+	std::map<DoorType, door_info_t> doors;
+};
+
+typedef struct door_position_s {
+	double lat;
+	double lon;
+	double alt;
+	float hdg;
+	double shift_x;
+	double shift_y;
+	double shift_z;
+} door_position_t;
+
+struct door_info_s {
+	float axialShift;
+	float lateralShift;
+	float verticalShift;
+	float hdgOffset; // Door might be on curved part of aircraft
+	DoorType type;
+	aircraft_info_t *aircraft;
+	DoorConnection connection;
+	jetway_info_t *jetway;
+};
 
 typedef struct dock_info_s {
 	std::string name;
@@ -216,6 +251,14 @@ typedef struct dock_info_s {
 	XPLMInstanceRef markerInstanceRef;
 } dock_info_t;
 
+typedef struct jetway_targets_s {
+	float rot1;
+	float rot2;
+	float rot3;
+	float extent;
+	float dist;
+} jetway_targets_t;
+
 typedef struct jetway_info_s {
 	std::string name;
 	double lat;
@@ -232,10 +275,12 @@ typedef struct jetway_info_s {
 	float wheelrotatec;
 	int warnlight;
 	// For random animation for now at least...
-	float rotate1_target;
-	float rotate2_target;
-	float rotate3_target;
-	float extent_target;
+	// float rotate1_target;
+	// float rotate2_target;
+	// float rotate3_target;
+	// float extent_target;
+	// For jetway connection...
+	jetway_targets_t targets;
 	// Params of the jetway for animation...
 	float height;
 	float wheelPos;
@@ -260,7 +305,15 @@ typedef struct jetway_info_s {
 	float maxWheels;
 	DoorType forDoorLocation;
 	XPLMInstanceRef markerInstanceRef;
-} jetway_info_t;
+};
+
+typedef struct jetway_position_s {
+	double local_x;
+	double local_y;
+	double local_z;
+	double alt;
+} jetway_position_t;
+
 
 static aircraft_info_t aircraft;
 
@@ -277,51 +330,6 @@ std::map<LatLonSpot, dock_info_t> samXMLdocks;
 std::map<LatLonSpot, jetway_info_t> jetways;
 std::map<LatLonSpot, dock_info_t> docks;
 
-/****************************************************************************
- * 
- *   State logic.  
- * 
- *        New aircraft loaded -> Parked at gate (beacon off / engines off)
- * 
- * 							  -> On runway, etc. (beacon on or engines running)
- * 
- *        Disconnected -> Connecting -> Connected -> Disconnecting -> Disconnected
- * 
- * 
- *		When disconnected (taxi-in) we monitor aircraft position to look for a marshaller
- *      to display to guide pilot in.
- * 
- * 		Diconnected split into two states... Taxi-out and Taxi-in.  During taxi-out
- * 		we don't display marshallers. We are in taxi-out if any of the following
- *      are true:
- * 					1. No engines running
- * 					2. Better pushback (or X-plane pushback) active
- * 					3. Aircraft has not exceeded 10 knots
- * 
- * 
- * 		We begin connecting either via a command or when aircraft is not moving 
- *      and beacon light is off.
- *		Connecting we animate the jetway connection. Marshaller disappears once
- *      we begin connecting.
- * 
- * 			During connecting we first determine what jetways will beconnected
- * 			to the aircraft.  We look at:
- * 
- * 				1. What jetways can reach which doors.  Respect the "forDoorLocation"
- * 				   value and doors defined in samiam.xml file as well as door operations
- * 				   specified in the file.
- * 
- * 				2. Animate the doors accordingly.
- *
- *      Connected.  We monitor aircraft movement and periodically adjust the
- * 	    door if aircraft settles/rises during loading/unloading beyond some
- *      threshold amount.
- * 
- *      Disconnecting.  We begin disconnecting either via command or when 
- *		beacon light is turned on AND doors closed (if we know the door datarefs) 
- * 		 
- * 
- ****************************************************************************/
 
 void slide_to(float *current, float target, float step) {
 	if (*current < target) {
@@ -487,22 +495,30 @@ void random_animate_dock(dock_info_t *dock) {
 	}
 }
 
-void random_animate_jetway(jetway_info_t *jetway) {
+bool random_animate_jetway(jetway_info_t *jetway) {
 
-	if (need_acf_properties) return;
+	if (need_acf_properties) return true;
 
-	if (jetway->rotate2 != jetway->rotate2_target) {
-		slide_to(&jetway->rotate2, jetway->rotate2_target, 0.217);
-	} else if (jetway->rotate1 != jetway->rotate1_target) {
-		slide_to(&jetway->rotate1, jetway->rotate1_target, 0.0317);
+	bool still_moving = true;
+
+	if (jetway->rotate2 != jetway->targets.rot2) {
+		slide_to(&jetway->rotate2, jetway->targets.rot2, 0.217);
+	} else if (jetway->rotate1 != jetway->targets.rot1) {
+		slide_to(&jetway->rotate1, jetway->targets.rot1, 0.0317);
+	} else if (jetway->rotate3 != jetway->targets.rot3 || 
+			   jetway->extent != jetway->targets.extent) {
+		slide_to(&jetway->rotate3, jetway->targets.rot3, 0.00217);
+		slide_to(&jetway->extent, jetway->targets.extent, 0.0179);
 	} else {
-		slide_to(&jetway->rotate3, jetway->rotate3_target, 0.00217);
-		slide_to(&jetway->extent, jetway->extent_target, 0.0179);
+		still_moving = false;
 	}
+
 	// Handle the wheel pillar...
 
 	// wheelPos is the distance of the wheel pillar from the rotunda...
 	jetway->wheels = (jetway->wheelPos + jetway->extent) * sin(DEG2RAD(jetway->rotate3));
+
+	return still_moving;
 }
 
 template<typename T>
@@ -544,6 +560,26 @@ std::vector<std::pair<double, T*>> within_range_in_map(LatLonSpot spot, float ra
 	}
 
 	return nearbyItems;
+}
+
+std::vector<jetway_info_t*> nearby_jetways(LatLonSpot spot, float range) {
+
+	geo_pos2_t targetLoc = GEO_POS2(spot.first, spot.second);
+	
+	std::vector<jetway_info_t*> nearby;
+
+	for(auto& [spotKey, jetway] : jetways) {
+		
+		auto jetwayLoc = GEO_POS2(spotKey.first, spotKey.second);
+
+		double dist = gc_distance(targetLoc, jetwayLoc);
+
+		if (dist < range) {
+			nearby.push_back(&jetway);
+		}
+	}
+
+	return nearby;
 }
 
 std::vector<std::pair<double, jetway_info_t*>> jetways_within_range(LatLonSpot spot, float range) {
@@ -805,15 +841,15 @@ bool_t jetway_rotate1_r_cb(dr_t *dr, void *valueout)
 		foundJetway->alt = worldAltitude;
 		foundJetway->hdg = dr_getf(&draw_object_psi_dr);
 
-		if (foundJetway == nearest_jetway) {
-			random_animate_jetway(foundJetway);
-		} else {
-			foundJetway->rotate1 = foundJetway->initialRot1;
-			foundJetway->rotate2 = foundJetway->initialRot2;
-			foundJetway->rotate3 = foundJetway->initialRot3;
-			foundJetway->extent  = foundJetway->initialExtent;
-			foundJetway->wheels = (foundJetway->wheelPos + foundJetway->extent) * sin(DEG2RAD(foundJetway->rotate3));
-		}
+		// if (foundJetway == nearest_jetway) {
+		// 	random_animate_jetway(foundJetway);
+		// } else {
+		// 	foundJetway->rotate1 = foundJetway->initialRot1;
+		// 	foundJetway->rotate2 = foundJetway->initialRot2;
+		// 	foundJetway->rotate3 = foundJetway->initialRot3;
+		// 	foundJetway->extent  = foundJetway->initialExtent;
+		// 	foundJetway->wheels = (foundJetway->wheelPos + foundJetway->extent) * sin(DEG2RAD(foundJetway->rotate3));
+		// }
 
 		*((float*) valueout) = foundJetway->rotate1;
 	}
@@ -1177,6 +1213,7 @@ void parseSAMxmlFile(std::string path)
 			} else if (doorLoc == "LF2") {
 				newSAMxmlJetway.forDoorLocation = LF2Door; 
 			} else {
+				logMsg("[WARN] Found a door location of %s for jetway %s", doorLoc.c_str(), newSAMxmlJetway.name.c_str());
 				newSAMxmlJetway.forDoorLocation = OTHERDoor;
 			}
 		} else {
@@ -1495,6 +1532,10 @@ PLUGIN_API int XPluginStart(
 	fdr_find(&gear_steers_dr, "sim/aircraft/overflow/acf_gear_steers");
 	fdr_find(&tire_z_dr, "sim/flightmodel/parts/tire_z_no_deflection");
 
+	fdr_find(&beacon_on_dr, "sim/cockpit2/switches/beacon_on");
+	fdr_find(&fnrml_gear_dr, "sim/flightmodel/forces/fnrml_gear");
+	fdr_find(&groundspeed_dr, "sim/flightmodel2/position/groundspeed");
+	fdr_find(&engine_burning_fuel_dr, "sim/flightmodel2/engines/engine_is_burning_fuel");
 
 
 	fdr_find(&draw_object_x_dr,   "sim/graphics/animation/draw_object_x");
@@ -1602,7 +1643,6 @@ PLUGIN_API int XPluginStart(
 
 	findSAMxmlFilesInCustomSceneries();
 
-
 	/************ LOAD MARKER OBJECT *************/
 
 	char tempCharPath[4096];
@@ -1670,43 +1710,48 @@ bool readAircraftDoorProperties()
 		const char *acf_prop = nullptr;
 
 		if (acf_prop = acf_find_prop(acf, "acf/_has_board_1")) {
-			has_board_1 = (std::stoi(acf_prop) == 1);
+			bool has_board_1 = (std::stoi(acf_prop) == 1);
 			if (has_board_1) {
 				if (acf_prop = acf_find_prop(acf, "acf/_board_1/0")) {
+					
+					door_info_t door_1;
+
 					door_1.lateralShift = METERS_PER_FOOT * std::stof(acf_prop);
 					door_1.verticalShift = METERS_PER_FOOT * std::stof(acf_find_prop(acf, "acf/_board_1/1")) - cgY_m;
 					door_1.axialShift = METERS_PER_FOOT * std::stof(acf_find_prop(acf, "acf/_board_1/2")) - cgZ_m;
 					door_1.hdgOffset = 0;
 					door_1.type = LF1Door;
-				} else {
-					has_board_1 = false;
+					door_1.aircraft = &aircraft;
+					door_1.jetway = nullptr;
+
+					aircraft.doors[LF1Door] = door_1;
 				}
 			}
-		} else {
-			has_board_1 = false;
 		}
 
 		if (acf_prop = acf_find_prop(acf, "acf/_has_board_2")) {
-			has_board_2 = (std::stoi(acf_prop) == 1);
+			bool has_board_2 = (std::stoi(acf_prop) == 1);
 			if (has_board_2) {
 				if (acf_prop = acf_find_prop(acf, "acf/_board_2/0")) {
+					
+					door_info_t door_2;
+
 					door_2.lateralShift = METERS_PER_FOOT * std::stof(acf_prop);
 					door_2.verticalShift = METERS_PER_FOOT * std::stof(acf_find_prop(acf, "acf/_board_2/1")) - cgY_m;
 					door_2.axialShift = METERS_PER_FOOT * std::stof(acf_find_prop(acf, "acf/_board_2/2")) - cgZ_m;
 					door_2.hdgOffset = 0;
 					door_2.type = LF2Door;
-				} else {
-					has_board_2 = false;
+					door_2.aircraft = &aircraft;
+					door_2.jetway = nullptr;
+
+					aircraft.doors[LF2Door] = door_2;
+
 				}
 			}
-		} else {
-			has_board_1 = false;
 		}
 	}
 
 	acf_file_free(acf);
-
-	logMsg("[DEBUG] Has board 1: %d and axial shift = %f, lateral shit = %f and vertical shift = %f", has_board_1, door_1.axialShift, door_1.lateralShift, door_1.verticalShift);
 
 	return true;
 }
@@ -1791,55 +1836,57 @@ void setSAMmarkerPositions() {
 	}
 }
 
-float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * refcon)
+void checkEnginesRunning()
 {
-	
-	if (need_acf_properties && 
-		readAircraftDoorProperties() && 
-		readAircraftGearInfo()) {
-		
-		need_acf_properties = false;
-	}
+	// sim/flightmodel2/engines/engine_is_burning_fuel
+    int engines_burning[16];
+    dr_getvi(&engine_burning_fuel_dr, engines_burning, 0, 16);
+    aircraft.engines = false;
+    for(auto i = 0; i < 16; i++) {
+    	if (engines_burning[i] == 1) {
+    		aircraft.engines = true;
+    		break;
+    	}
+    }
+}
 
-	// if (notYetFullyLoaded == true) {
-
-	// 	XPLMPluginID  myPluginID = XPLMGetMyID();
-
-	// 	char outFilePath[1000];
-	// 	const char *directorySeperator;
-
-	// 	directorySeperator = XPLMGetDirectorySeparator();
-
-	// 	XPLMGetPluginInfo(myPluginID, NULL, outFilePath, NULL, NULL);    /* Can be NULL */
-
-	// 	logMsg("Our plugin file path is: %s", outFilePath);
-	// 	logMsg("Our directory seperator is: %s", directorySeperator);
-		
-	// 	notYetFullyLoaded = false;
+void checkWeightOnWheels()
+{
+    // float gear_deflections[NUMBER_OF_GEAR];
+	// XPLMGetDatavf(_tire_vertical_deflection_mtr_vf, &gear_deflections[0], 0, NUMBER_OF_GEAR);
+	// for (unsigned int gear_indx = 0; gear_indx < NUMBER_OF_GEAR; gear_indx++) {
+	// 	if (gear_deflections[gear_indx] > 0.0) {
+	// 		aircraft.airborne = false;
+    //     }
 	// }
+	// aircraft.airborne = true;
+}
 
-
+void updateAircraft()
+{
 	// Get the aircraft position....
 
-	double local_x = dr_getf(&local_x_dr);
-    double local_y = dr_getf(&local_y_dr);
-    double local_z = dr_getf(&local_z_dr);
+	aircraft.local_x = dr_getf(&local_x_dr);
+    aircraft.local_y = dr_getf(&local_y_dr);
+    aircraft.local_z = dr_getf(&local_z_dr);
 
     // Get the aircraft true heading...
     aircraft.hdg = dr_getf(&true_psi_dr);
 
+    aircraft.beacon = (dr_geti(&beacon_on_dr) == 1);
+    checkEnginesRunning();
+    //checkWeightOnWheels();
+    aircraft.airborne = !(dr_getf(&fnrml_gear_dr) > 0);
+    aircraft.velocity = dr_getf(&groundspeed_dr); // meters per second
 
-    double dx, dy, dz;
-   
-    XPLMLocalToWorld(local_x,    
-                         local_y,    
-                         local_z,    
-                         &aircraft.lat,  
-                         &aircraft.lon,    
-                         &aircraft.alt);
+    XPLMLocalToWorld(aircraft.local_x,    
+                     aircraft.local_y,    
+                     aircraft.local_z,    
+                     &aircraft.lat,  
+                     &aircraft.lon,    
+                     &aircraft.alt);
 
-
-    /* Project into aircraft oriented frame.... */
+        /* Project into aircraft oriented frame.... */
     
     float current_opengl_xp_q[4];
     dr_getvf32(&q_dr, current_opengl_xp_q, 0, 4);
@@ -1864,13 +1911,13 @@ float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * 
     /* Used for projection of aircraft position and velocity errors into aircraft frame */ 
     struct quat ecmigl_2_local_quat = quat_ecmigl2local(GEO_POS2(lat_ref, lon_ref), 0);
     
-    struct quat acf_q_local = quat_rot_concat(ecmigl_2_local_quat, acf_q_earth_fixed);
+    aircraft.q_local = quat_rot_concat(ecmigl_2_local_quat, acf_q_earth_fixed);
 
     // Calculate nosewheel spot...
     {
     	struct quat body_frame_shift_vector = quat_from_vect3l_gl(VECT3L(0, 0, aircraft.nosewheelZ));
 
-	    struct quat recovered_local_difference_vector = squat_multiply(acf_q_local, squat_multiply(body_frame_shift_vector, squat_inverse(acf_q_local)));
+	    struct quat recovered_local_difference_vector = squat_multiply(aircraft.q_local, squat_multiply(body_frame_shift_vector, squat_inverse(aircraft.q_local)));
 	    vect3l_t vxyz_recovered_vect3 = quat_to_vect3l_gl(recovered_local_difference_vector);
 	        
 	    double local_x_value_shift = vxyz_recovered_vect3.x;
@@ -1879,185 +1926,623 @@ float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * 
 
 	    double nosewheelAlt;
 
-	    XPLMLocalToWorld(local_x + local_x_value_shift,    
-                          local_y + local_y_value_shift,    
-                          local_z + local_z_value_shift,    
-                          &aircraft.nosewheelSpot.first,  
-                          &aircraft.nosewheelSpot.second,    
-                          &nosewheelAlt);
+	    XPLMLocalToWorld(aircraft.local_x + local_x_value_shift,    
+                         aircraft.local_y + local_y_value_shift,    
+                         aircraft.local_z + local_z_value_shift,    
+                         &aircraft.nosewheelSpot.first,  
+                         &aircraft.nosewheelSpot.second,    
+                         &nosewheelAlt);
     }
 
-    // Make this a function that is door specific...
+}
 
-    door_info_t *target_door = &door_1;
+door_position_t door_position(door_info_t *door) {
 
+	if (!door->aircraft) {
+		logMsg("[ERROR] Door found unattached to aircraft ... Blame Boeing? Spirit?");
+		assert(false);
+	}
 
-    struct quat body_frame_shift_vector = quat_from_vect3l_gl(VECT3L(target_door->lateralShift, target_door->verticalShift, target_door->axialShift));
+	door_position_t door_position;
 
-    struct quat recovered_local_difference_vector = squat_multiply(acf_q_local, squat_multiply(body_frame_shift_vector, squat_inverse(acf_q_local)));
-    vect3l_t vxyz_recovered_vect3 = quat_to_vect3l_gl(recovered_local_difference_vector);
-        
-    double local_x_value_shift = vxyz_recovered_vect3.x;
-    double local_y_value_shift = vxyz_recovered_vect3.y;
-    double local_z_value_shift = vxyz_recovered_vect3.z;
+	struct quat body_frame_shift_vector = quat_from_vect3l_gl(VECT3L(door->lateralShift, door->verticalShift, door->axialShift));
 
-    double target_door_lat, target_door_lon, target_door_alt;
-    float target_door_hdg;
-
-    XPLMLocalToWorld(local_x + local_x_value_shift,    
-                          local_y + local_y_value_shift,    
-                          local_z + local_z_value_shift,    
-                          &target_door_lat,  
-                          &target_door_lon,    
-                          &target_door_alt);
-
-    target_door_hdg = aircraft.hdg + target_door->hdgOffset;
-
-
-    // Find jetways that are within 200m of aircraft...
-    float range = 200.0f;
-    std::vector<std::pair<double, jetway_info_t*>> nearbyJetways = jetways_within_range(std::make_pair(target_door_lat, target_door_lon), range);
-
+    struct quat recovered_local_difference_vector = squat_multiply(door->aircraft->q_local, squat_multiply(body_frame_shift_vector, squat_inverse(door->aircraft->q_local)));
+    vect3l_t vxyz_recovered_shift_vect3 = quat_to_vect3l_gl(recovered_local_difference_vector);
     
-    float nearest_distance_sqrd = 2 * range * range;
-    nearest_jetway = nullptr;
+    door_position.shift_x = vxyz_recovered_shift_vect3.x;
+    door_position.shift_y = vxyz_recovered_shift_vect3.y;
+    door_position.shift_z = vxyz_recovered_shift_vect3.z;
 
-    double local_x_nearest_jetway, local_y_nearest_jetway, local_z_nearest_jetway;
+    XPLMLocalToWorld(door->aircraft->local_x + door_position.shift_x,    
+                     door->aircraft->local_y + door_position.shift_y,    
+                     door->aircraft->local_z + door_position.shift_z,    
+                      &door_position.lat,  
+                      &door_position.lon,    
+                      &door_position.alt);
 
-    for (auto& distJetway : nearbyJetways) {
+    door_position.hdg = door->aircraft->hdg + door->hdgOffset;
 
-    	double local_x_jetway, local_y_jetway, local_z_jetway;
-        
-        XPLMWorldToLocal(distJetway.second->lat,  
-                              distJetway.second->lon,    
-                              distJetway.second->alt,    
-                              &local_x_jetway,    
-                              &local_y_jetway,    
-                              &local_z_jetway); 
+    return door_position;
+}
 
-        dx = local_x_jetway - local_x;
-        dy = local_y_jetway - local_y;
-        dz = local_z_jetway - local_z;
-        
-	    struct quat local_difference_vector = quat_from_vect3l_gl(VECT3L(dx, dy, dz));
-	    struct quat recovered_acf_difference_vector = squat_multiply(squat_inverse(acf_q_local), squat_multiply(local_difference_vector, acf_q_local));        
-	    vect3l_t vxyz_vect3 = quat_to_vect3l_gl(recovered_acf_difference_vector);
+LatLonSpot door_spot(door_info_t *door) {
+	auto position = door_position(door);
+	return std::make_pair(position.lat, position.lon);
+}
 
-	    double axial_error = vxyz_vect3.z;
-        double vertical_error = vxyz_vect3.y;
-        double lateral_error = vxyz_vect3.x;
-
-        if (lateral_error < 0) {
-        	float jetway_dist_sqrd = lateral_error * lateral_error + axial_error * axial_error;
-        	if (jetway_dist_sqrd < nearest_distance_sqrd) {
-        		nearest_distance_sqrd = jetway_dist_sqrd;
-        		nearest_jetway = distJetway.second;
-        		
-        		local_x_nearest_jetway = local_x_jetway;
-        		local_y_nearest_jetway = local_y_jetway;
-        		local_z_nearest_jetway = local_z_jetway;
-
-        		
-
-        		//logMsg("[DEBUG] Candidate jetway %s to the left of aircraft at distance of %f meters", nearest_jetway->name.c_str(), std::sqrt(nearest_distance_sqrd));
-        	}
-        }	
-    }
-
-    // if (nearest_jetway) {
-    // 	logMsg("[DEBUG] Found jetway %s to the left of aircraft at distance of %f meters has the following params:", nearest_jetway->name.c_str(), std::sqrt(nearest_distance_sqrd));
-    // 	logMsg("[DEBUG] latitude: %f", nearest_jetway->lat);
-    // 	logMsg("[DEBUG] longitude: %f", nearest_jetway->lon);
-    // 	logMsg("[DEBUG] heading: %f", nearest_jetway->hdg);
-    // }
-
-    
-
-    if (nearest_jetway) {
-	    
-	    setMarkerPosition();
-    	
-
-	    XPLMProbeResult probe_result = XPLMProbeTerrainXYZ(_terrainProbe,
-          (float) local_x_nearest_jetway,
-          (float) local_y_nearest_jetway,
-          (float) local_z_nearest_jetway,
-          &_terrainProbeInfo);
-
-	    double rotundaBaseLatitude, rotundaBaseLongitude, rotundaBaseMSL;
-        XPLMLocalToWorld(_terrainProbeInfo.locationX,    
-                         _terrainProbeInfo.locationY,    
-                         _terrainProbeInfo.locationZ,    
-                         &rotundaBaseLatitude,  
-                         &rotundaBaseLongitude,    
-                         &rotundaBaseMSL);
-
-
-    	// Need to calculate the lat and lon of where the cabin should be...
-
-    	// If door .hdgOffset = 0 then we apply a negative (for left door) lateral offset of the cabinLength...
-    	// in the aircraft coordinates.  If .hdgOffset > 0 then we do cos() that for lateral and -sin() for axial...
-
-    	struct quat cabin_body_frame_shift_vector 
-    				= quat_from_vect3l_gl(VECT3L(-nearest_jetway->cabinLength*cos(DEG2RAD(target_door->hdgOffset)), 
-    											 0, -nearest_jetway->cabinLength*sin(DEG2RAD(target_door->hdgOffset))));
-
-	    struct quat cabin_recovered_local_difference_vector = squat_multiply(acf_q_local, squat_multiply(cabin_body_frame_shift_vector, squat_inverse(acf_q_local)));
-	    vect3l_t cabin_vxyz_recovered_vect3 = quat_to_vect3l_gl(cabin_recovered_local_difference_vector);
-	        
-	    double local_x_value_shift = vxyz_recovered_vect3.x;
-	    double local_y_value_shift = vxyz_recovered_vect3.y;
-	    double local_z_value_shift = vxyz_recovered_vect3.z;
-
-	    double cabin_1_lat, cabin_1_lon, cabin_1_alt;
-
-	    XPLMLocalToWorld(local_x + local_x_value_shift + cabin_vxyz_recovered_vect3.x,    
-	                          local_y + local_y_value_shift + cabin_vxyz_recovered_vect3.y,    
-	                          local_z + local_z_value_shift + cabin_vxyz_recovered_vect3.z,    
-	                          &cabin_1_lat,  
-	                          &cabin_1_lon,    
-	                          &cabin_1_alt);
-
-		//logMsg("[DEBUG] Aircraft alt is %f, door alt is %f, door vertical shift is %f", aircraft.alt, target_door->alt, target_door->verticalShift);
-
-	    //logMsg("[DEBUG] Cabin 1 alt is %f", cabin_1_alt);
-
-	    //logMsg("[DEBUG] Rotunda base is at alt %f meters msl", rotundaBaseMSL);
-
-		geo_pos2_t rotunda_geo_pos2 = GEO_POS2(nearest_jetway->lat, nearest_jetway->lon);
-		geo_pos2_t cabin_geo_pos2 = GEO_POS2(cabin_1_lat, cabin_1_lon);	                          
-
-	    double bearing_from_rotunda_to_cabin = gc_point_hdg(rotunda_geo_pos2, cabin_geo_pos2);
+std::string door_type_name(DoorType type) {
 	
-	    nearest_jetway->rotate1_target = shift_normalized_hdg(normalize_hdg(bearing_from_rotunda_to_cabin - nearest_jetway->hdg));
+	std::string name = "<UNKNOWN>";
 
-		nearest_jetway->rotate2_target = shift_normalized_hdg(normalize_hdg(90 - (nearest_jetway->hdg + nearest_jetway->rotate1_target) + target_door_hdg));
-		//logMsg("[DEBUG] Rotate 2 target is %f degrees", nearest_jetway->rotate2_target );
+	switch(type) {
+		case ANYDoor:
+			name = "ANY Door";
+			break;
+		case LF1Door:
+			name = "LF1 Door";
+			break;
+		case LF2Door:
+			name = "LF2 Door";
+			break;
+		case LR1Door:
+			name = "LR1 Door";
+			break;
+		case OTHERDoor:
+			name = "OTHER Door";
+			break;
+		case DISCONNECTED_TAXI_OUT:
+			logMsg("[INFO] New ops state is DISCONNECTED_TAXI_OUT");
+			break;
+	}
+	return name;
+}
 
-		// CONCERN: I think we should just convert the jetway position to local_x, local_y, local_z
-		//          and use those and the shifts above to in opengl coordinates calculate these distances?
+jetway_position_t jetway_position(jetway_info_t *jetway)
+{
+	jetway_position_t jetway_pos;
 
-		double heightRise = cabin_1_alt - nearest_jetway->height - rotundaBaseMSL;
+	XPLMWorldToLocal(jetway->lat,  
+                     jetway->lon,    
+                     jetway->alt,    
+                      &jetway_pos.local_x,    
+                      &jetway_pos.local_y,    
+                      &jetway_pos.local_z); 
 
-		//logMsg("[DEBUG] Height rise is %f", heightRise);
+	XPLMProbeResult probe_result = XPLMProbeTerrainXYZ(_terrainProbe,
+	          (float) jetway_pos.local_x,
+	          (float) jetway_pos.local_y,
+	          (float) jetway_pos.local_z,
+	          &_terrainProbeInfo);
 
-		double distance_from_rotunda_to_cabin = gc_distance(rotunda_geo_pos2, cabin_geo_pos2); 
+    double rotundaBaseLatitude, rotundaBaseLongitude, rotundaBaseMSL;
+    XPLMLocalToWorld(_terrainProbeInfo.locationX,    
+                     _terrainProbeInfo.locationY,    
+                     _terrainProbeInfo.locationZ,    
+                     &rotundaBaseLatitude,  
+                     &rotundaBaseLongitude,    
+                     &rotundaBaseMSL);
+
+    jetway_pos.alt = rotundaBaseMSL;
+
+    logMsg("[DEBUG] Difference between jetway->alt of %f and rotundaBaseMSL %f", jetway->alt, rotundaBaseMSL);
+
+    return jetway_pos;
+}	
+
+std::pair<bool, jetway_targets_t> jetway_can_reach_door(jetway_info_t *jetway, door_info_t *door)
+{
+	//Check if door can reach airplane door....
+
+	jetway_targets_t target;
+
+	if (jetway->forDoorLocation != ANYDoor && jetway->forDoorLocation != door->type) {
+		return std::pair(false, target);
+	}
+
+	door_position_t door_pos = door_position(door);
+
+	jetway_position_t jetway_pos = jetway_position(jetway);
+
+	// Need to calculate the lat and lon of where the cabin should be...
+
+	// If door .hdgOffset = 0 then we apply a negative (for left door) lateral offset of the cabinLength...
+	// in the aircraft coordinates.  If .hdgOffset > 0 then we do cos() that for lateral and -sin() for axial...
+
+	struct quat cabin_body_frame_shift_vector 
+				= quat_from_vect3l_gl(VECT3L(-jetway->cabinLength*cos(DEG2RAD(door->hdgOffset)), 
+											 0, -jetway->cabinLength*sin(DEG2RAD(door->hdgOffset))));
+
+    struct quat cabin_recovered_local_difference_vector = squat_multiply(aircraft.q_local, squat_multiply(cabin_body_frame_shift_vector, squat_inverse(aircraft.q_local)));
+    vect3l_t cabin_vxyz_recovered_vect3 = quat_to_vect3l_gl(cabin_recovered_local_difference_vector);
+    
+    double cabin_lat, cabin_lon, cabin_alt;
+
+    XPLMLocalToWorld(aircraft.local_x + door_pos.shift_x + cabin_vxyz_recovered_vect3.x,    
+                     aircraft.local_y + door_pos.shift_x + cabin_vxyz_recovered_vect3.y,    
+                     aircraft.local_z + door_pos.shift_x + cabin_vxyz_recovered_vect3.z,    
+                          &cabin_lat,  
+                          &cabin_lon,    
+                          &cabin_alt);
+
+	geo_pos2_t rotunda_geo_pos2 = GEO_POS2(jetway->lat, jetway->lon);
+	geo_pos2_t cabin_geo_pos2 = GEO_POS2(cabin_lat, cabin_lon);	                          
+
+    double bearing_from_rotunda_to_cabin = gc_point_hdg(rotunda_geo_pos2, cabin_geo_pos2);
+
+    
+    target.rot1 = shift_normalized_hdg(normalize_hdg(bearing_from_rotunda_to_cabin - nearest_jetway->hdg));
+
+    if (target.rot1 > jetway->maxRot1 || target.rot1 < jetway->minRot1) {
+    	return std::pair(false, target);
+    }
+
+	target.rot2 = shift_normalized_hdg(normalize_hdg(90 - (jetway->hdg + target.rot1) + aircraft.hdg + door->hdgOffset));
+	
+	if (target.rot2 > jetway->maxRot2 || target.rot2 < jetway->minRot2) {
+		return std::pair(false, target);
+	}
+
+	double heightRise = cabin_alt - jetway->height - jetway_pos.alt;
+
+	double distance_from_rotunda_to_cabin = gc_distance(rotunda_geo_pos2, cabin_geo_pos2); 
+	
+	// Use this for sorting jetway connections...
+	// CONCERN: Should it be distance to door? 
+	target.dist = distance_from_rotunda_to_cabin;
+
+	target.extent = std::sqrt(heightRise*heightRise + 
+		                            distance_from_rotunda_to_cabin*distance_from_rotunda_to_cabin)
+									    - jetway->cabinPos;
+
+	if (target.extent > jetway->maxExtent || target.extent < jetway->minExtent) {
+		return std::pair(false, target);
+	}
+
+	if (target.extent + jetway->cabinPos != 0) {
+		target.rot3 = RAD2DEG(std::asin(heightRise/(target.extent + jetway->cabinPos)));
+	} else {
+		logMsg("[ERROR] Can't calculate rotate3 target because extent target + cabin position sums to zero, would have divide by zero!");
+		return std::pair(false, target);
+	}
+
+	if (target.rot3 > jetway->maxRot3 || target.rot3 < jetway->minRot3) {
+		return std::pair(false, target);
+	}
+
+	return std::pair(true, target);;
+}
+
+static std::deque<door_info_t*> connectionPlan;
+static std::deque<door_info_t*> disconnectionPlan;
+
+bool jetwayInConnectionPlan(jetway_info_t *jetway) {
+	for (auto it = connectionPlan.begin(); it != connectionPlan.end(); it++) {
+		if ((*it)->jetway == jetway) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void connectDoor(door_info_t *door) {
 		
+	// Get nearby jetways... within 200m of aircraft...
+	float range = 200.0f;
+	
+	std::vector<jetway_info_t*> jetways = nearby_jetways(door_spot(door), range);
+	
+	jetway_info_t *foundJetway = nullptr;
+	jetway_targets_t foundTargets;
+	float foundDistance = range;
 
-		nearest_jetway->extent_target = std::sqrt(heightRise*heightRise + 
-			                                      distance_from_rotunda_to_cabin*distance_from_rotunda_to_cabin)
-											 - nearest_jetway->cabinPos;
+	for(auto jetway : jetways) {
+		
+		// NOTE: Only look at jetways don't already plan to connect...
+		if (!jetwayInConnectionPlan(jetway)) {
+			auto [canReach, computedTargets] = jetway_can_reach_door(jetway, door);
 
-		if (nearest_jetway->extent_target + nearest_jetway->cabinPos != 0) {
-			nearest_jetway->rotate3_target = RAD2DEG(std::asin(heightRise/(nearest_jetway->extent_target + nearest_jetway->cabinPos)));
-		} else {
-			logMsg("[ERROR] Can't calculate rotate3 target because extent target + cabin position sums to zero, would have divide by zero!");
-			nearest_jetway->rotate3_target = 0;
+			if (canReach && computedTargets.dist < range) {
+				foundJetway = jetway;
+				foundTargets = computedTargets;
+			}
+		}			
+	}
+
+	if (foundJetway) {
+		foundJetway->targets = foundTargets;
+		door->connection = DOORWILLCONNECT;
+		door->jetway = foundJetway;
+
+		connectionPlan.push_back(door);
+	}
+
+}
+
+void computeConnectionPlan()
+{
+
+	// Figure out which jetbridges will connect to which doors...
+
+	// Start with LF1 door...
+	if (aircraft.doors.count(LF1Door)) {
+		connectDoor(&aircraft.doors[LF1Door]);
+	}
+
+	if (aircraft.doors.count(LF2Door)) {
+		connectDoor(&aircraft.doors[LF2Door]);
+	}
+
+	logMsg("[DEBUG] Found %d jetways to connect...", connectionPlan.size());
+	//for (auto& [doorType, door] : aircraft.doors) {
+	for (auto door : connectionPlan) {
+		logMsg("[DEBUG] Will connect door %s to jetway %s", door_type_name(door->type).c_str(), door->jetway->name.c_str());
+		
+		if (currentState == CONNECTED) {
+			logMsg("[INFO] We have loaded in at a gate, perform immediate jetway connections...");
+			door->connection = DOORCONNECTED;
+			door->jetway->rotate1 = door->jetway->targets.rot1;
+			door->jetway->rotate2 = door->jetway->targets.rot2;
+			door->jetway->rotate3 = door->jetway->targets.rot3;
+			door->jetway->extent = door->jetway->targets.extent;
+		
+			disconnectionPlan.push_front(door);
+		}
+	}
+
+	if (currentState == CONNECTED) {
+		connectionPlan.clear();
+	}
+
+	if (!connectionPlan.empty()) {
+		auto door = connectionPlan.front();
+		logMsg("[DEBUG] Begin moving jetway %s to door %s", 
+			door->jetway->name.c_str(), door_type_name(door->type).c_str());
+	}
+}
+
+void computeDisconnectPlan()
+{
+	if(!connectionPlan.empty()) {
+
+		// Assume the first jetway is the one in progress of being moved...
+		// So we will push it to the disconnectionPlan to move first
+		// push back since we will draw from the back...
+
+		disconnectionPlan.push_back(connectionPlan.front());
+		connectionPlan.pop_front();
+
+		// For the rest we will assume they haven't moved jetways yet
+		// and disassociate them...
+
+		while(!connectionPlan.empty()) {
+			auto door = connectionPlan.front();
+			door->jetway = nullptr;
+			door->connection = DOORDISCONNECTED;
+			connectionPlan.pop_front();
+		}
+	}
+
+	assert(connectionPlan.empty());
+}
+
+void setOpsState(OpsState newOpsState)
+{
+	if (newOpsState == currentState) {
+		return;
+	}
+
+	switch(newOpsState) {
+		case NOSTATE:
+			// Aircraft has loaded in, lets determine our state...
+			logMsg("[INFO] New ops state is NOSTATE");
+			break;
+		case DISCONNECTED_TAXI_IN:
+			logMsg("[INFO] New ops state is DISCONNECTED_TAXI_IN");
+			break;
+		case CONNECTING:
+			logMsg("[INFO] New ops state is CONNECTING");
+			computeConnectionPlan();
+			break;
+		case CONNECTED:
+			logMsg("[INFO] New ops state is CONNECTED");
+			break;
+		case DISCONNECTING:
+			logMsg("[INFO] New ops state is DISCONNECTING");
+			computeDisconnectPlan();
+			break;
+		case DISCONNECTED_TAXI_OUT:
+			logMsg("[INFO] New ops state is DISCONNECTED_TAXI_OUT");
+			break;
+	}
+
+	currentState = newOpsState;
+}
+
+void determineLoadinOpsState()
+{
+	/* New aircraft loaded, lets determine our state...
+			-> Parked at gate (beacon off / engines off) -> CONNECTED
+ 
+ 			-> On runway, etc. (beacon on or engines running) -> DISCONNECTED_TAXI_IN
+	*/
+
+	if (!aircraft.engines && !aircraft.beacon) {
+		setOpsState(CONNECTED);
+		computeConnectionPlan();
+	} else {
+		setOpsState(DISCONNECTED_TAXI_IN);
+	}
+}
+
+void verifyTaxiIn()
+{
+	// CONCERN: Should we consider engines running as well?
+
+	if (!aircraft.beacon && aircraft.velocity < 0.1 * KTS2MPS) {
+		setOpsState(CONNECTING);
+	}
+}
+
+bool pushbackActive()
+{
+	return false;
+}
+
+void verifyTaxiOut()
+{
+	/*
+	*	During taxi-out
+	* 		we don't display marshallers. We are in taxi-out if beacon is on and any of the following
+	*       are true:
+	* 					1. No engines running
+	* 					2. Better pushback (or X-plane pushback) active
+	* 					3. Aircraft has not exceeded 10 knots
+	*/
+
+	// ONLY STATE TRANSITION POSSIBLE IS TO TAXI IN... (even if airborne we will be taxi-in)
+
+	if (aircraft.beacon) {
+		if (!aircraft.engines || pushbackActive() || aircraft.velocity < 10 * KTS2MPS) {
+			return;
+		} 
+	}
+
+	// CONCERN: Maybe once we have traveled some distance from the gate we would renable
+	//          taxi-in as well?
+
+	setOpsState(DISCONNECTED_TAXI_IN);
+
+}
+
+bool connectingFinished() {
+	for (auto& [doorType, door] : aircraft.doors) {
+		if (door.connection == DOORJETWAYMOVING) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool disconnectingFinished() {
+	for (auto& [doorType, door] : aircraft.doors) {
+		if (door.connection != DOORDISCONNECTED) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void verifyConnecting()
+{
+	if (aircraft.beacon || aircraft.engines || aircraft.velocity > 0.1 * KTS2MPS) {
+		setOpsState(DISCONNECTING);
+	}
+
+	if (connectingFinished()) {
+		setOpsState(CONNECTED);
+	}
+}
+
+void verifyConnected()
+{
+	if (aircraft.beacon || aircraft.engines || aircraft.velocity > 0.1 * KTS2MPS) {
+		setOpsState(DISCONNECTING);
+	}
+}
+
+void verifyDisconnecting()
+{
+	if (disconnectingFinished()) {
+		setOpsState(DISCONNECTED_TAXI_OUT);
+	}	
+}
+
+/****************************************************************************
+ * 
+ *   State logic.  
+ * 
+ *        New aircraft loaded -> Parked at gate (beacon off / engines off)
+ * 
+ * 							  -> On runway, etc. (beacon on or engines running)
+ * 
+ *        Disconnected -> Connecting -> Connected -> Disconnecting -> Disconnected
+ * 
+ * 
+ *		When disconnected (taxi-in) we monitor aircraft position to look for a marshaller
+ *      to display to guide pilot in.
+ * 
+ * 		Diconnected split into two states... Taxi-out and Taxi-in.  During taxi-out
+ * 		we don't display marshallers. We are in taxi-out if any of the following
+ *      are true:
+ * 					1. No engines running
+ * 					2. Better pushback (or X-plane pushback) active
+ * 					3. Aircraft has not exceeded 10 knots
+ * 
+ * 
+ * 		We begin connecting either via a command or when aircraft is not moving 
+ *      and beacon light is off.
+ *		Connecting we animate the jetway connection. Marshaller disappears once
+ *      we begin connecting.
+ * 
+ * 			During connecting we first determine what jetways will beconnected
+ * 			to the aircraft.  We look at:
+ * 
+ * 				1. What jetways can reach which doors.  Respect the "forDoorLocation"
+ * 				   value and doors defined in samiam.xml file as well as door operations
+ * 				   specified in the file.
+ * 
+ * 				2. Animate the doors accordingly.
+ *
+ *      Connected.  We monitor aircraft movement and periodically adjust the
+ * 	    door if aircraft settles/rises during loading/unloading beyond some
+ *      threshold amount.
+ * 
+ *      Disconnecting.  We begin disconnecting either via command or when 
+ *		beacon light is turned on AND doors closed (if we know the door datarefs) 
+ * 		 
+ * 
+ ****************************************************************************/
+
+void updateOpsState()
+{
+	switch(currentState) {
+		case NOSTATE:
+			// Aircraft has loaded in, lets determine our state...
+			determineLoadinOpsState();
+			break;
+		case DISCONNECTED_TAXI_IN:
+			verifyTaxiIn();
+			break;
+		case CONNECTING:
+			verifyConnecting();
+			break;
+		case CONNECTED:
+			verifyConnected();
+			break;
+		case DISCONNECTING:
+			verifyDisconnecting();
+			break;
+		case DISCONNECTED_TAXI_OUT:
+			verifyTaxiOut();
+			break;
+	}
+}
+
+void handleJetwayAutoleveling()
+{
+	for (auto& [doorType, door] : aircraft.doors) {
+		if (door.connection == DOORCONNECTED) {
+			if (door.jetway) {
+				logMsg("[DEBUG] We need to worry about autoleveling jetway %s to this door", door.jetway->name.c_str());
+			} else {
+				logMsg("[ERROR] We have a connected door but no jetway!");
+				door.connection = DOORDISCONNECTED;
+			}
+		}
+	}
+}
+
+void handleJetwayConnectionAnimation()
+{
+	logMsg("[DEBUG] Have %d doors to connect...", connectionPlan.size());
+
+	if (!connectionPlan.empty()) {
+
+		auto door = connectionPlan.front();
+
+		assert(door->connection == DOORJETWAYMOVING);
+		
+		auto still_moving = random_animate_jetway(door->jetway);
+
+		if (!still_moving) {
+			door->connection = DOORCONNECTED;
+			logMsg("[DEBUG] Finised moving jetway %s to door %s", 
+				door->jetway->name.c_str(), door_type_name(door->type).c_str());
+			disconnectionPlan.push_front(connectionPlan.front());
+			connectionPlan.pop_front();
+		
+			if (!connectionPlan.empty()) {
+				door = connectionPlan.front();
+				logMsg("[DEBUG] Begin moving jetway %s to door %s", 
+					door->jetway->name.c_str(), door_type_name(door->type).c_str());
+			}
+		
 		}
 
 	}
+	//  else {
+	// 	setOpsState(CONNECTED);
+	// }
+}
 
+void setJetwayTargetsToInitialPosition(jetway_info_t *jetway)
+{
+	jetway->targets.rot1   = jetway->initialRot1;
+	jetway->targets.rot2   = jetway->initialRot2;
+	jetway->targets.rot3   = jetway->initialRot3;
+	jetway->targets.extent = jetway->initialExtent;
+}
+
+void handleJetwayDisconnectAnimation()
+{
+
+	logMsg("[DEBUG] Have %d doors to disconnect...", disconnectionPlan.size());
+
+	if (!disconnectionPlan.empty()) {
+
+		auto door = disconnectionPlan.back();
+
+		assert(door->connection == DOORJETWAYMOVING || door->connection == DOORCONNECTED);
+		
+		setJetwayTargetsToInitialPosition(door->jetway);
+
+		auto still_moving = random_animate_jetway(door->jetway);
+
+		if (!still_moving) {
+			door->connection = DOORDISCONNECTED;
+			logMsg("[DEBUG] Finised removing jetway %s from door %s", 
+				door->jetway->name.c_str(), door_type_name(door->type).c_str());
+			disconnectionPlan.pop_back();
+		
+			if (!disconnectionPlan.empty()) {
+				door = disconnectionPlan.back();
+				logMsg("[DEBUG] Begin removing jetway %s from door %s", 
+					door->jetway->name.c_str(), door_type_name(door->type).c_str());
+			}
+		
+		}
+	}
+	// } else {
+	// 	setOpsState(DISCONNECTED_TAXI_OUT);
+	// }
+}
+
+float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * refcon)
+{
 	
+	if (need_acf_properties && 
+		readAircraftDoorProperties() && 
+		readAircraftGearInfo()) {
+	
+		currentState = NOSTATE; // Aircraft has loaded in, lets determine our state... 
+	
+		need_acf_properties = false;
+	}
+
+	updateAircraft();
+
+	updateOpsState();
+
+	if (currentState == CONNECTED) {
+		handleJetwayAutoleveling();
+	} else if (currentState == CONNECTING) {
+		handleJetwayConnectionAnimation();
+	} else if (currentState == DISCONNECTING) {
+		handleJetwayDisconnectAnimation();
+	}
+    
 	if (_markerObjectRef) {
 		//setManualMarkerPosition();
 
@@ -2247,12 +2732,6 @@ void menu_handler(void * in_menu_ref, void * in_item_ref)
 	if (!strcmp((const char *) in_item_ref, "Changelog")) {
 		
 	}
-}
-
-
-bool jetway_can_reach_door(jetway_info_t *jetway, door_info_t *door)
-{
-	//Check if door can reach airplane door....
 }
 
 

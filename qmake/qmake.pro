@@ -142,8 +142,8 @@ win32:contains(CROSS_COMPILE, x86_64-w64-mingw32-) {
 
 	LIBS += -ldbghelp
 
-	LIBS += -L../SOIL/build-win32/
-	INCLUDEPATH += ../SOIL/include
+	#LIBS += -L../SOIL/build-win32/
+	#INCLUDEPATH += ../SOIL/include
 }
 
 unix:!macx {
@@ -166,8 +166,8 @@ linux-g++-64 {
 	    --static-openal --libs")
 
 
-	LIBS += -L../SOIL/build/
-	INCLUDEPATH += ../SOIL/include
+	#LIBS += -L../SOIL/build/
+	#INCLUDEPATH += ../SOIL/include
 }
 
 macx {
@@ -196,7 +196,7 @@ macx-clang {
 	LIBS += $$system("$$[LIBACFUTILS]/pkg-config-deps mac-64 \
 	    --static-openal --libs")
 
-	LIBS += -L../SOIL/build/
+	#LIBS += -L../SOIL/build/
 }
 
 HEADERS += ../libquat/src/*.h
