@@ -137,14 +137,20 @@ bool need_acf_properties = false;
 
 typedef std::pair<double, double> LatLonSpot;
 
-static double aircraftLat, aircraftLon, aircraftAlt, aircraftHdg;
-
-static double nosewheelZ;
-static LatLonSpot nosewheelSpot;
-
 static XPLMProbeRef _terrainProbe;
 static XPLMProbeInfo_t _terrainProbeInfo;
 
+
+typedef enum OpsState
+{
+	DISCONNECTED_TAXI_IN,
+	CONNECTING,
+	CONNECTED,
+	DISCONNECTED,
+	DISCONNECTED_TAXI_OUT
+} OpsState;
+
+static OpsState currentState;
 
 typedef enum DoorType
 {
@@ -160,10 +166,6 @@ typedef struct door_info_s {
 	float lateralShift;
 	float verticalShift;
 	float hdgOffset; // Door might be on curved part of aircraft
-	double lat;
-	double lon;
-	double alt;
-	float  hdg;
 	DoorType type;
 } door_info_t;
 
@@ -184,6 +186,18 @@ bool same_spot(LatLonSpot spot1, LatLonSpot spot2)
 {
 	return fuzzyCompare(spot1.first, spot2.first, 4) && fuzzyCompare(spot1.second, spot2.second, 4);
 }
+
+typedef struct aircraft_info_s {
+	double lat;
+	double lon;
+	double alt;
+	float hdg;
+	bool beacon;
+	bool engines;
+	float velocity;
+	double nosewheelZ;
+	LatLonSpot nosewheelSpot; 
+} aircraft_info_t;
 
 typedef struct dock_info_s {
 	std::string name;
@@ -248,6 +262,8 @@ typedef struct jetway_info_s {
 	XPLMInstanceRef markerInstanceRef;
 } jetway_info_t;
 
+static aircraft_info_t aircraft;
+
 static jetway_info_t* nearest_jetway = nullptr;
 
 static dock_info_t* nearest_dock = nullptr;
@@ -269,10 +285,41 @@ std::map<LatLonSpot, dock_info_t> docks;
  * 
  * 							  -> On runway, etc. (beacon on or engines running)
  * 
- *        Diconnected -> Connecting -> Connected -> Disconnecting -> Disconnected
+ *        Disconnected -> Connecting -> Connected -> Disconnecting -> Disconnected
  * 
  * 
+ *		When disconnected (taxi-in) we monitor aircraft position to look for a marshaller
+ *      to display to guide pilot in.
  * 
+ * 		Diconnected split into two states... Taxi-out and Taxi-in.  During taxi-out
+ * 		we don't display marshallers. We are in taxi-out if any of the following
+ *      are true:
+ * 					1. No engines running
+ * 					2. Better pushback (or X-plane pushback) active
+ * 					3. Aircraft has not exceeded 10 knots
+ * 
+ * 
+ * 		We begin connecting either via a command or when aircraft is not moving 
+ *      and beacon light is off.
+ *		Connecting we animate the jetway connection. Marshaller disappears once
+ *      we begin connecting.
+ * 
+ * 			During connecting we first determine what jetways will beconnected
+ * 			to the aircraft.  We look at:
+ * 
+ * 				1. What jetways can reach which doors.  Respect the "forDoorLocation"
+ * 				   value and doors defined in samiam.xml file as well as door operations
+ * 				   specified in the file.
+ * 
+ * 				2. Animate the doors accordingly.
+ *
+ *      Connected.  We monitor aircraft movement and periodically adjust the
+ * 	    door if aircraft settles/rises during loading/unloading beyond some
+ *      threshold amount.
+ * 
+ *      Disconnecting.  We begin disconnecting either via command or when 
+ *		beacon light is turned on AND doors closed (if we know the door datarefs) 
+ * 		 
  * 
  ****************************************************************************/
 
@@ -335,7 +382,7 @@ readAircraftGearInfo(void) {
     }
 
     if (!n_gear) {
-    	nosewheelZ = 0;
+    	aircraft.nosewheelZ = 0;
     	logMsg("[ERROR] Failed to find gear!");
     	return false;
     }
@@ -343,7 +390,7 @@ readAircraftGearInfo(void) {
     /* Read nosegear long axis deflections */
     VERIFY3S(dr_getvf(&tire_z_dr, tire_z, 0, 10), >=, n_gear);
     nw_i = -1;
-    nosewheelZ = 1e10;
+    aircraft.nosewheelZ = 1e10;
 
     logMsg("[DEBUG] Here...");
 
@@ -351,9 +398,9 @@ readAircraftGearInfo(void) {
     VERIFY3S(dr_getvi(&gear_steers_dr, gear_steers, 0, 10), >=, n_gear);
     for (int i = 0; i < n_gear; i++) {
         if (gear_steers[gear_is[i]] == 1 &&
-            tire_z[gear_is[i]] < nosewheelZ) {
+            tire_z[gear_is[i]] < aircraft.nosewheelZ) {
             nw_i = gear_is[i];
-            nosewheelZ = tire_z[gear_is[i]];
+            aircraft.nosewheelZ = tire_z[gear_is[i]];
         }
     }
 
@@ -365,10 +412,10 @@ readAircraftGearInfo(void) {
      */
     if (nw_i == -1) {
         nw_i = gear_is[0];
-        nosewheelZ = tire_z[gear_is[0]];
+        aircraft.nosewheelZ = tire_z[gear_is[0]];
     }
 
-    logMsg("[DEBUG] Found nosewheelZ of %f", nosewheelZ);
+    logMsg("[DEBUG] Found aircraft.nosewheelZ of %f", aircraft.nosewheelZ);
 
     // /* Nose gear strut length and tire radius */
     // VERIFY3S(dr_getvf(&drs.leg_len, &bp.acf.nw_len, bp.acf.nw_i, 1), ==, 1);
@@ -391,7 +438,7 @@ void random_animate_dock(dock_info_t *dock) {
 	
 	if (need_acf_properties) return;
 
-	auto noswewheelLoc = GEO_POS2(nosewheelSpot.first, nosewheelSpot.second);
+	auto noswewheelLoc = GEO_POS2(aircraft.nosewheelSpot.first, aircraft.nosewheelSpot.second);
 	
 	auto dockLoc = GEO_POS2(dock->dockLat, dock->dockLon);
 
@@ -1338,7 +1385,7 @@ void setManualMarkerPosition()
         
         XPLMWorldToLocal(manualMarkerLat,  
                               manualMarkerLon,    
-                              aircraftAlt + 2,    
+                              aircraft.alt + 2,    
                               &local_x_marker,    
                               &local_y_marker,    
                               &local_z_marker); 
@@ -1779,7 +1826,7 @@ float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * 
     double local_z = dr_getf(&local_z_dr);
 
     // Get the aircraft true heading...
-    aircraftHdg = dr_getf(&true_psi_dr);
+    aircraft.hdg = dr_getf(&true_psi_dr);
 
 
     double dx, dy, dz;
@@ -1787,9 +1834,9 @@ float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * 
     XPLMLocalToWorld(local_x,    
                          local_y,    
                          local_z,    
-                         &aircraftLat,  
-                         &aircraftLon,    
-                         &aircraftAlt);
+                         &aircraft.lat,  
+                         &aircraft.lon,    
+                         &aircraft.alt);
 
 
     /* Project into aircraft oriented frame.... */
@@ -1821,7 +1868,7 @@ float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * 
 
     // Calculate nosewheel spot...
     {
-    	struct quat body_frame_shift_vector = quat_from_vect3l_gl(VECT3L(0, 0, nosewheelZ));
+    	struct quat body_frame_shift_vector = quat_from_vect3l_gl(VECT3L(0, 0, aircraft.nosewheelZ));
 
 	    struct quat recovered_local_difference_vector = squat_multiply(acf_q_local, squat_multiply(body_frame_shift_vector, squat_inverse(acf_q_local)));
 	    vect3l_t vxyz_recovered_vect3 = quat_to_vect3l_gl(recovered_local_difference_vector);
@@ -1835,8 +1882,8 @@ float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * 
 	    XPLMLocalToWorld(local_x + local_x_value_shift,    
                           local_y + local_y_value_shift,    
                           local_z + local_z_value_shift,    
-                          &nosewheelSpot.first,  
-                          &nosewheelSpot.second,    
+                          &aircraft.nosewheelSpot.first,  
+                          &aircraft.nosewheelSpot.second,    
                           &nosewheelAlt);
     }
 
@@ -1854,19 +1901,22 @@ float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * 
     double local_y_value_shift = vxyz_recovered_vect3.y;
     double local_z_value_shift = vxyz_recovered_vect3.z;
 
+    double target_door_lat, target_door_lon, target_door_alt;
+    float target_door_hdg;
+
     XPLMLocalToWorld(local_x + local_x_value_shift,    
                           local_y + local_y_value_shift,    
                           local_z + local_z_value_shift,    
-                          &target_door->lat,  
-                          &target_door->lon,    
-                          &target_door->alt);
+                          &target_door_lat,  
+                          &target_door_lon,    
+                          &target_door_alt);
 
-    target_door->hdg = aircraftHdg + target_door->hdgOffset;
+    target_door_hdg = aircraft.hdg + target_door->hdgOffset;
 
 
     // Find jetways that are within 200m of aircraft...
     float range = 200.0f;
-    std::vector<std::pair<double, jetway_info_t*>> nearbyJetways = jetways_within_range(std::make_pair(target_door->lat, target_door->lon), range);
+    std::vector<std::pair<double, jetway_info_t*>> nearbyJetways = jetways_within_range(std::make_pair(target_door_lat, target_door_lon), range);
 
     
     float nearest_distance_sqrd = 2 * range * range;
@@ -1914,16 +1964,12 @@ float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * 
         }	
     }
 
-    if (nearest_jetway) {
-    	logMsg("[DEBUG] Found jetway %s to the left of aircraft at distance of %f meters has the following params:", nearest_jetway->name.c_str(), std::sqrt(nearest_distance_sqrd));
-    	logMsg("[DEBUG] latitude: %f", nearest_jetway->lat);
-    	logMsg("[DEBUG] longitude: %f", nearest_jetway->lon);
-    	logMsg("[DEBUG] heading: %f", nearest_jetway->hdg);
-    	//logMsg("[DEBUG] minRot3: %f", nearest_jetway->minRot3);
-    	//logMsg("[DEBUG] maxRot3: %f", nearest_jetway->maxRot3);
-    	//logMsg("[DEBUG] minWheels: %f", nearest_jetway->minWheels);
-    	//logMsg("[DEBUG] wheelPos: %f", nearest_jetway->wheelPos);
-    }
+    // if (nearest_jetway) {
+    // 	logMsg("[DEBUG] Found jetway %s to the left of aircraft at distance of %f meters has the following params:", nearest_jetway->name.c_str(), std::sqrt(nearest_distance_sqrd));
+    // 	logMsg("[DEBUG] latitude: %f", nearest_jetway->lat);
+    // 	logMsg("[DEBUG] longitude: %f", nearest_jetway->lon);
+    // 	logMsg("[DEBUG] heading: %f", nearest_jetway->hdg);
+    // }
 
     
 
@@ -1972,7 +2018,7 @@ float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * 
 	                          &cabin_1_lon,    
 	                          &cabin_1_alt);
 
-		//logMsg("[DEBUG] Aircraft alt is %f, door alt is %f, door vertical shift is %f", aircraftAlt, target_door->alt, target_door->verticalShift);
+		//logMsg("[DEBUG] Aircraft alt is %f, door alt is %f, door vertical shift is %f", aircraft.alt, target_door->alt, target_door->verticalShift);
 
 	    //logMsg("[DEBUG] Cabin 1 alt is %f", cabin_1_alt);
 
@@ -1985,7 +2031,7 @@ float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * 
 	
 	    nearest_jetway->rotate1_target = shift_normalized_hdg(normalize_hdg(bearing_from_rotunda_to_cabin - nearest_jetway->hdg));
 
-		nearest_jetway->rotate2_target = shift_normalized_hdg(normalize_hdg(90 - (nearest_jetway->hdg + nearest_jetway->rotate1_target) + target_door->hdg));
+		nearest_jetway->rotate2_target = shift_normalized_hdg(normalize_hdg(90 - (nearest_jetway->hdg + nearest_jetway->rotate1_target) + target_door_hdg));
 		//logMsg("[DEBUG] Rotate 2 target is %f degrees", nearest_jetway->rotate2_target );
 
 		// CONCERN: I think we should just convert the jetway position to local_x, local_y, local_z
@@ -2204,6 +2250,13 @@ void menu_handler(void * in_menu_ref, void * in_item_ref)
 }
 
 
+bool jetway_can_reach_door(jetway_info_t *jetway, door_info_t *door)
+{
+	//Check if door can reach airplane door....
+}
+
+
+
 /* X-Plane 12 Native Jeways ....
 
 	sim/graphics/animation/jetways/jw_base_rotation	float	n		
@@ -2219,6 +2272,7 @@ void menu_handler(void * in_menu_ref, void * in_item_ref)
 	sim/graphics/animation/jetways/jw_stairs_bogie_angle	float	n		
 	sim/graphics/animation/jetways/jw_is_moving
 
-NOTE THEY ARE NOT WRITABLE.  WHY NOT ALLOW US TO WRITE AND OVERRIDE BEHAVIOR?
+NOTE THEY ARE NOT WRITABLE.  THEY ARE USED AS INSTANCED DATAREFS, SO NO WAY 
+FOR US TO TAKE THEM OVER.  BUMMER.
 
 */
