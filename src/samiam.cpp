@@ -317,8 +317,6 @@ typedef struct jetway_position_s {
 
 static aircraft_info_t aircraft;
 
-static jetway_info_t* nearest_jetway = nullptr;
-
 static dock_info_t* nearest_dock = nullptr;
 
 // These are read in for ALL scenery from the samiam.xml and sam.xml files...
@@ -502,11 +500,14 @@ bool random_animate_jetway(jetway_info_t *jetway) {
 	bool still_moving = true;
 
 	if (jetway->rotate2 != jetway->targets.rot2) {
+		logMsg("[DEBUG] Moving rotate 2..");
 		slide_to(&jetway->rotate2, jetway->targets.rot2, 0.217);
 	} else if (jetway->rotate1 != jetway->targets.rot1) {
+		logMsg("[DEBUG] Moving rotate 1..");
 		slide_to(&jetway->rotate1, jetway->targets.rot1, 0.0317);
 	} else if (jetway->rotate3 != jetway->targets.rot3 || 
 			   jetway->extent != jetway->targets.extent) {
+		logMsg("[DEBUG] Moving rotate 3 and extent..");
 		slide_to(&jetway->rotate3, jetway->targets.rot3, 0.00217);
 		slide_to(&jetway->extent, jetway->targets.extent, 0.0179);
 	} else {
@@ -614,9 +615,9 @@ jetway_info_t* jetway_found_sam_xml(LatLonSpot spot, float targetHdg, float tole
         }
     }
 
-    if (candidate_jetway) { 
-    	logMsg("[INFO] Found closest possible SAM jetway %s, heading differs by %f degrees!", candidate_jetway->name.c_str(), candidate_jetway_hdg_difference);	
-    }
+    //if (candidate_jetway) { 
+    	//logMsg("[INFO] Found closest possible SAM jetway %s, heading differs by %f degrees!", candidate_jetway->name.c_str(), candidate_jetway_hdg_difference);	
+    //}
 
     return candidate_jetway;
 }
@@ -828,7 +829,7 @@ bool_t jetway_rotate1_r_cb(dr_t *dr, void *valueout)
 
 			jetways[spot] = newJetway;
 
-			logMsg("[DEBUG] Found a SAM xml specified jetway with name %s", newJetway.name.c_str());
+			//logMsg("[DEBUG] Found a SAM xml specified jetway with name %s", newJetway.name.c_str());
 		} else {		
 			//logMsg("[WARN] Found an unknown new jetway at at lat %f, lon %f, alt %f, now have %d jetways", worldLatitude, worldLongitude, worldAltitude, jetways.size());
 		}
@@ -1027,11 +1028,11 @@ bool_t jetway_warnlight_r_cb(dr_t *dr, void *valueout)
 	jetway_info_t *foundJetway = jetway_found(spot);
 
 	if (foundJetway) {
-		if (foundJetway == nearest_jetway) {
-			*((float*) valueout) = 1;
-		} else {
+		// if (foundJetway == nearest_jetway) {
+		// 	*((float*) valueout) = 1;
+		// } else {
 			*((float*) valueout) = 0;
-		}
+		//}
 		//*((float*) valueout) = foundJetway->warnlight;
 	}
 
@@ -1370,26 +1371,26 @@ void setMarkerPosition()
 
     if(_markerInstanceRef)
     {
-        logMsg("Setting jetway marker position for jetway %s ...", nearest_jetway->name.c_str());
-        XPLMDrawInfo_t drawInfo;
-        drawInfo.structSize = sizeof(XPLMDrawInfo_t);
+        // logMsg("Setting jetway marker position for jetway %s ...", nearest_jetway->name.c_str());
+        // XPLMDrawInfo_t drawInfo;
+        // drawInfo.structSize = sizeof(XPLMDrawInfo_t);
 
-		double local_x_jetway, local_y_jetway, local_z_jetway;
+		// double local_x_jetway, local_y_jetway, local_z_jetway;
         
-        XPLMWorldToLocal(nearest_jetway->lat,  
-                              nearest_jetway->lon,    
-                              nearest_jetway->alt + nearest_jetway->height + 2,    
-                              &local_x_jetway,    
-                              &local_y_jetway,    
-                              &local_z_jetway); 
+        // XPLMWorldToLocal(nearest_jetway->lat,  
+        //                       nearest_jetway->lon,    
+        //                       nearest_jetway->alt + nearest_jetway->height + 2,    
+        //                       &local_x_jetway,    
+        //                       &local_y_jetway,    
+        //                       &local_z_jetway); 
 
-        drawInfo.x = local_x_jetway;
-        drawInfo.y = local_y_jetway;
-        drawInfo.z = local_z_jetway;
-        drawInfo.pitch = 0;
-        drawInfo.roll = 0;
-        drawInfo.heading = nearest_jetway->hdg;
-        XPLMInstanceSetPosition(_markerInstanceRef, &drawInfo, nullptr);
+        // drawInfo.x = local_x_jetway;
+        // drawInfo.y = local_y_jetway;
+        // drawInfo.z = local_z_jetway;
+        // drawInfo.pitch = 0;
+        // drawInfo.roll = 0;
+        // drawInfo.heading = nearest_jetway->hdg;
+        // XPLMInstanceSetPosition(_markerInstanceRef, &drawInfo, nullptr);
     }
 }
 
@@ -1443,9 +1444,7 @@ void load_marker_object_cb(XPLMObjectRef inObject, void *inRefcon)
     logMsg("Avatar object loaded successfully.");
     _markerObjectRef = inObject;  
 
-    if (nearest_jetway) {
-    	setMarkerPosition();
-    } 
+    setMarkerPosition(); 
 }
 
 
@@ -1723,6 +1722,7 @@ bool readAircraftDoorProperties()
 					door_1.type = LF1Door;
 					door_1.aircraft = &aircraft;
 					door_1.jetway = nullptr;
+					door_1.connection = DOORDISCONNECTED;
 
 					aircraft.doors[LF1Door] = door_1;
 				}
@@ -1743,6 +1743,7 @@ bool readAircraftDoorProperties()
 					door_2.type = LF2Door;
 					door_2.aircraft = &aircraft;
 					door_2.jetway = nullptr;
+					door_2.connection = DOORDISCONNECTED;
 
 					aircraft.doors[LF2Door] = door_2;
 
@@ -1963,6 +1964,8 @@ door_position_t door_position(door_info_t *door) {
 
     door_position.hdg = door->aircraft->hdg + door->hdgOffset;
 
+    logMsg("[DEBUG] Got here...");
+
     return door_position;
 }
 
@@ -2040,6 +2043,8 @@ std::pair<bool, jetway_targets_t> jetway_can_reach_door(jetway_info_t *jetway, d
 		return std::pair(false, target);
 	}
 
+	logMsg("[DEBUG] Checking if jetway %s can reach door %s", jetway->name.c_str(), door_type_name(door->type).c_str());
+
 	door_position_t door_pos = door_position(door);
 
 	jetway_position_t jetway_pos = jetway_position(jetway);
@@ -2070,8 +2075,9 @@ std::pair<bool, jetway_targets_t> jetway_can_reach_door(jetway_info_t *jetway, d
 
     double bearing_from_rotunda_to_cabin = gc_point_hdg(rotunda_geo_pos2, cabin_geo_pos2);
 
-    
-    target.rot1 = shift_normalized_hdg(normalize_hdg(bearing_from_rotunda_to_cabin - nearest_jetway->hdg));
+    target.rot1 = shift_normalized_hdg(normalize_hdg(bearing_from_rotunda_to_cabin - jetway->hdg));
+
+    logMsg("[DEBUG] Found target rot1 of %f vs (min %f and max %f)", target.rot1, jetway->minRot1, jetway->maxRot1);
 
     if (target.rot1 > jetway->maxRot1 || target.rot1 < jetway->minRot1) {
     	return std::pair(false, target);
@@ -2079,11 +2085,15 @@ std::pair<bool, jetway_targets_t> jetway_can_reach_door(jetway_info_t *jetway, d
 
 	target.rot2 = shift_normalized_hdg(normalize_hdg(90 - (jetway->hdg + target.rot1) + aircraft.hdg + door->hdgOffset));
 	
+    logMsg("[DEBUG] Found target rot2 of %f vs (min %f and max %f)", target.rot2, jetway->minRot2, jetway->maxRot2);
+
 	if (target.rot2 > jetway->maxRot2 || target.rot2 < jetway->minRot2) {
 		return std::pair(false, target);
 	}
 
 	double heightRise = cabin_alt - jetway->height - jetway_pos.alt;
+
+	logMsg("[DEBUG] Found heightRise of %f", heightRise);
 
 	double distance_from_rotunda_to_cabin = gc_distance(rotunda_geo_pos2, cabin_geo_pos2); 
 	
@@ -2094,6 +2104,8 @@ std::pair<bool, jetway_targets_t> jetway_can_reach_door(jetway_info_t *jetway, d
 	target.extent = std::sqrt(heightRise*heightRise + 
 		                            distance_from_rotunda_to_cabin*distance_from_rotunda_to_cabin)
 									    - jetway->cabinPos;
+
+	logMsg("[DEBUG] Found target extent of %f vs (min %f and max %f)", target.extent, jetway->minExtent, jetway->maxExtent);
 
 	if (target.extent > jetway->maxExtent || target.extent < jetway->minExtent) {
 		return std::pair(false, target);
@@ -2106,9 +2118,11 @@ std::pair<bool, jetway_targets_t> jetway_can_reach_door(jetway_info_t *jetway, d
 		return std::pair(false, target);
 	}
 
-	if (target.rot3 > jetway->maxRot3 || target.rot3 < jetway->minRot3) {
-		return std::pair(false, target);
-	}
+	logMsg("[DEBUG] Found target rot3 of %f vs (min %f and max %f)", target.rot3, jetway->minRot3, jetway->maxRot3);
+
+	// if (target.rot3 > jetway->maxRot3 || target.rot3 < jetway->minRot3) {
+	// 	return std::pair(false, target);
+	// }
 
 	return std::pair(true, target);;
 }
@@ -2137,11 +2151,17 @@ void connectDoor(door_info_t *door) {
 	jetway_targets_t foundTargets;
 	float foundDistance = range;
 
+	logMsg("[DEBUG] Found %d jetways within range of %f meters", jetways.size(), range);
+
 	for(auto jetway : jetways) {
 		
 		// NOTE: Only look at jetways don't already plan to connect...
 		if (!jetwayInConnectionPlan(jetway)) {
 			auto [canReach, computedTargets] = jetway_can_reach_door(jetway, door);
+
+			if (canReach) {
+				logMsg("[DEBUG] Found jetway %s can reach this door", jetway->name.c_str());
+			}
 
 			if (canReach && computedTargets.dist < range) {
 				foundJetway = jetway;
@@ -2328,6 +2348,7 @@ bool connectingFinished() {
 bool disconnectingFinished() {
 	for (auto& [doorType, door] : aircraft.doors) {
 		if (door.connection != DOORDISCONNECTED) {
+			logMsg("[DEBUG] Found door that is not disconnected...");
 			return false;
 		}
 	}
@@ -2522,13 +2543,16 @@ void handleJetwayDisconnectAnimation()
 float flightLoopCallback(float elapsedMe, float elapsedSim, int counter, void * refcon)
 {
 	
-	if (need_acf_properties && 
-		readAircraftDoorProperties() && 
-		readAircraftGearInfo()) {
-	
-		currentState = NOSTATE; // Aircraft has loaded in, lets determine our state... 
-	
-		need_acf_properties = false;
+	if (need_acf_properties) {
+		if (readAircraftDoorProperties() && 
+			readAircraftGearInfo()) {
+		
+			currentState = NOSTATE; // Aircraft has loaded in, lets determine our state... 
+		
+			need_acf_properties = false;
+		} else {
+			return 1.0f;
+		}
 	}
 
 	updateAircraft();

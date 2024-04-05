@@ -40,16 +40,7 @@ else
 	qmake -spec macx-clang
 fi
 make -j 3 &&
-mv libmac.xpl.dylib "$output_dir/mac_x64/SharedFlight.xpl"
-
-if [[ $TESTINSTALLPATH != "**Unknown**" ]]
-then
-	# rm is needed because code signing on arm requires a new file be created
-	# not to just copy in place...
-	rm "$TESTINSTALLPATH/SharedFlight.xpl"
-	
-	cp "$output_dir/mac_x64/SharedFlight.xpl" "$TESTINSTALLPATH/SharedFlight.xpl"
-fi
+mv libmac.xpl.dylib "$output_dir/mac_x64/SamIAm.xpl"
 
 if [ $? != 0 ] ; then
 	exit 1
